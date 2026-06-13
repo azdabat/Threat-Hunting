@@ -327,6 +327,189 @@ graph TD
 
 ---
 
+## The Detection Inference Spectrum — All Layers Are Hunts
+
+> *"A primitive captures what happened.*  
+> *A router rule asks whether it matters.*  
+> *A composite confirms that it does.*  
+> *All three are hunts. What changes is the claim being made."*
+
+---
+
+The distinction between primitives, router rules, and composite sensors is not **hunt vs non-hunt**. Every layer is a threat hunt. The distinction is **specificity of claim** and **depth of inference** — how much the rule asserts about what the evidence means, and how much evidence is required before that assertion is made.
+
+---
+
+### The Spectrum of Inference
+
+```mermaid
+graph LR
+    P["PRIMITIVE\nWhat happened?\nZero inference\n'scrcons.exe loaded vbscript.dll'\nNo scoring\nNo context\nNo claim about intent"]
+
+    R["ROUTER RULE\nIs something bad\nin progress?\nLow-medium inference\n'Ingress transfer intent\ndetected across estate'\nScored · Routed\nClaim: adversary goal"]
+
+    C["COMPOSITE SENSOR\nDid this specific\nattack happen?\nHigh inference\n'bitsadmin /transfer to AppData\nfrom cmd.exe parent confirmed'\nScored + threshold\nClaim: minimum truth"]
+
+    P -->|"Add scoring\nand routing"| R
+    R -->|"Narrow to one technique\none noise domain\nADX validate"| C
+```
+
+---
+
+### The Claim Each Layer Makes
+
+The difference is not the analytical activity — all three are threat hunts. The difference is what claim the hunt is making and how much evidence is required to make it.
+
+| Layer | Hunt Claim | Evidence Required | Analyst Action |
+|-------|-----------|------------------|----------------|
+| **Primitive** | "This event occurred" | The event itself — no interpretation | Index it · stitch it later |
+| **Router Rule** | "Adversary intent is present" | Convergence of intent signals across a technique family | Triage — run the composite on this DeviceId |
+| **Composite Sensor** | "This specific attack occurred" | Minimum truth anchor + optional reinforcement | Investigate — create incident |
+
+---
+
+### The More Accurate Model
+
+Rather than three separate layers, this is a **continuous spectrum of inference** with three operating points that the MTDF has formalised. All three points are active hunts operating at different levels of specificity.
+
+```mermaid
+flowchart LR
+    subgraph Spectrum["Inference Spectrum — All Are Hunts"]
+        direction LR
+        A["ATOMIC\nPRIMITIVE\n──────────\nHunt claim:\nEvent occurred\nInference: zero\nThreshold: none\nOutput: indexed fact"]
+        B["ROUTER\nRULE\n──────────\nHunt claim:\nIntent present\nInference: low\nThreshold: ≥ 30\nOutput: RoutingDirective"]
+        C["COMPOSITE\nSENSOR\n──────────\nHunt claim:\nAttack confirmed\nInference: high\nThreshold: ≥ 75\nOutput: HunterDirective"]
+
+        A -->|"Add scoring\nAdd routing\nMore inference"| B
+        B -->|"Narrow to one technique\nOne noise domain\nADX validate\nMore inference"| C
+    end
+
+    style A fill:#0a1a0f,stroke:#00ff88,color:#00ff88
+    style B fill:#1a1000,stroke:#f59e0b,color:#fcd34d
+    style C fill:#0a1628,stroke:#00aaff,color:#7dd3fc
+```
+
+---
+
+### What Changes as You Move Across the Spectrum
+
+**From primitive to router rule:** a scoring model and routing output are added. The hunt now makes a claim about intent rather than just recording an event. The primitive `bitsadmin.exe executed` becomes the router rule claim `ingress transfer intent is present across this technique family`.
+
+**From router rule to composite sensor:** the scope narrows to one technique, the rule is validated against real telemetry in ADX, a unified suppression model is applied, and the threshold is raised. The router rule claim `ingress transfer intent` becomes the composite claim `bitsadmin /transfer with remote URL and AppData staging path confirmed`.
+
+**Primitives are not passive.** When you run a 30-day primitive collector across the estate looking for `scrcons.exe` loading script DLLs, you are hunting. You are asking a question of telemetry and receiving a list of facts. The inference depth is zero — but the analytical act is identical to every other layer.
+
+---
+
+### The Full Pipeline — From Event to Incident
+
+```mermaid
+flowchart TD
+    E["Raw telemetry event\nbitsadmin.exe executed\n/transfer flag observed"]
+
+    P["PRIMITIVE COLLECTOR\nEvent indexed\nNo threshold · No score\n30-day rolling index\nEntity key: DeviceId"]
+
+    R["ROUTER RULE\nIngress transfer intent detected\nRiskScore = 45 ≥ 30\nRoutingDirective:\nPIVOT TO T1197 Composite\non DeviceId=X"]
+
+    C["COMPOSITE SENSOR\nT1197 BITSAdmin\nMinimum truth confirmed\nbitsadmin /transfer + AppData\nRiskScore = 90 CRITICAL\nHunterDirective fires"]
+
+    I["INCIDENT LAYER\nRouter breadth + Composite depth\nstitched via DeviceId entity key\nAttack narrative assembled\nBlast radius scoped"]
+
+    E --> P
+    E --> R
+    R -->|"Analyst runs composite\non DeviceId=X"| C
+    P -->|"30-day index surfaces\nstaging artefacts\nconnects Day 0 to Day 3"| C
+    C --> I
+    P -->|"Direct stitch\nif no composite\nhas fired yet"| I
+
+    style P fill:#0a1a0f,stroke:#00ff88,color:#00ff88
+    style R fill:#1a1000,stroke:#f59e0b,color:#fcd34d
+    style C fill:#0a1628,stroke:#00aaff,color:#7dd3fc
+    style I fill:#1a0a0e,stroke:#ff2244,color:#fca5a5
+```
+
+---
+
+### What Happens When You Strip a Router Rule Down
+
+Remove the scoring, remove the routing, remove the phase structure — keep only the Phase 1 broad surface filter. The router rule becomes a primitive collector.
+
+The Phase 1 filter of Hunt Pack 04 (Ingress Tool Transfer) with no threshold and no scoring is a primitive index of every LOLBin downloader execution on the estate for the last 30 days. That is architecturally valid and useful — but it serves a different purpose at a different inference point on the spectrum.
+
+```mermaid
+flowchart LR
+    subgraph RR["Router Rule — Hunt Pack 04"]
+        direction TB
+        R1["Phase 1: Broad filter\nbitsadmin · certutil · curl · powershell"]
+        R2["Phase 2: Signal enrichment\nIsMasqueraded · HasScript · BadParent"]
+        R3["Phase 3: Score\nBase 0 · Threshold 30"]
+        R4["Phase 4: RoutingDirective\nPIVOT TO composite"]
+        R1 --> R2 --> R3 --> R4
+    end
+
+    subgraph Prim["Primitive Collector\n(Phase 1 only — stripped)"]
+        PP["Phase 1 filter\nbitsadmin · certutil · curl · powershell\nNo scoring · No threshold\n30-day rolling index"]
+    end
+
+    subgraph CS["Composite Sensor — T1197"]
+        direction TB
+        C1["Phase 1: Minimum truth\nbitsadmin /transfer + remote URL"]
+        C2["Phase 2: Reinforcement\nstaging path · parent · extension"]
+        C3["Phase 3: Score\nBase 55 · Threshold 75"]
+        C4["Phase 4: HunterDirective"]
+        C1 --> C2 --> C3 --> C4
+    end
+
+    RR -->|"RoutingDirective\nPIVOT TO composite"| CS
+    Prim -.->|"30-day index\nentity key stitch"| CS
+
+    style Prim fill:#0a1a0f,stroke:#00ff88,color:#00ff88
+    style RR fill:#1a1000,stroke:#f59e0b,color:#fcd34d
+    style CS fill:#0a1628,stroke:#00aaff,color:#7dd3fc
+```
+
+---
+
+### The Corrected Framework Statement
+
+```
+Primitives        → threat hunts at zero inference
+Router Rules      → threat hunts at low-medium inference
+Composite Sensors → threat hunts at high inference
+
+All three are hunts.
+What changes is the claim being made,
+the evidence required to make it,
+and the action the analyst takes when it fires.
+```
+
+---
+
+### Inference Depth at a Glance
+
+| Property | Primitive | Router Rule | Composite Sensor |
+|----------|-----------|-------------|-----------------|
+| **Inference depth** | Zero | Low — medium | High |
+| **Hunt claim** | Event occurred | Adversary goal in progress | Specific attack confirmed |
+| **Base score** | None | 0 | 55 |
+| **Threshold** | None | ≥ 30 | ≥ 75 |
+| **Output** | Indexed fact | RoutingDirective | HunterDirective |
+| **Lifecycle** | Permanent | Temporary | Permanent once ADX validated |
+| **Analyst action** | Stitch via entity key | Run composite on DeviceId | Investigate · create incident |
+| **Noise tolerance** | High — wide net | Medium — scored intent | Low — minimum truth required |
+| **Analogy** | The net | The structured hunt | The anchor |
+
+---
+
+> **The primitive is the net.**  
+> **The router rule is the structured hunt.**  
+> **The composite is the anchor.**  
+> **The incident is the story.**  
+> **All three are hunts. The inference depth is what separates them.**
+
+
+---
+
 ## The MTDF Hunting Doctrine
 
 ### Minimum Truth Applied to Hunting
