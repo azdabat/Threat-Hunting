@@ -1,0 +1,47 @@
+// HUNT_TH-005 — LOLBin Download: Outlier Process Survey
+// Hypothesis: A process is downloading content via HTTP/FTP
+// that is NOT in the router rule's TargetProcs vocabulary
+// Hunt type: Rarity-baseline hybrid
+// Validates against: DeviceProcessEvents (your MDE data)
+let Lookback = 30d;
+let RarityWindow = 90d;
+// Known vocabulary from your router rule — exclude these
+// The hunt is specifically looking OUTSIDE this list
+let KnownLOLBins = dynamic([
+    "bitsadmin.exe","certutil.exe","curl.exe","wget.exe",
+    "ftp.exe","tftp.exe","powershell.exe", "mshta.exe "
+]);
+let AllDownloadTouches =
+    DeviceProcessEvents
+    | where Timestamp >= ago(Lookback)
+    | where ProcessCommandLine has_any ("http","https","ftp","download","urlcache")
+    | where FileName !in~ (KnownLOLBins)  // explicitly outside router vocabulary
+    | project
+        Timestamp, DeviceName, DeviceId,
+        ActorProcess = FileName,
+        ActorPath = InitiatingProcessFileName,
+        Account = AccountName,
+        CommandLine = ProcessCommandLine,
+        ParentProcess = InitiatingProcessFileName;
+let HistoricalBaseline =
+    DeviceProcessEvents
+    | where Timestamp >= ago(RarityWindow)
+      and Timestamp < ago(Lookback)
+    | where ProcessCommandLine has_any ("http","https","ftp","download","urlcache")
+    | where FileName !in~ (KnownLOLBins)
+    | summarize HistoricalCount = count()
+      by ActorProcess = FileName;
+AllDownloadTouches
+| join kind=leftouter HistoricalBaseline on ActorProcess
+| extend
+    NeverSeenBefore = iif(isnull(HistoricalCount), true, false),
+    RareGlobally = iif(HistoricalCount < 3, true, false)
+| summarize
+    FirstSeen = min(Timestamp),
+    LastSeen = max(Timestamp),
+    TouchCount = count(),
+    DistinctDevices = dcount(DeviceName),
+    SampleCLI = any(CommandLine),
+    ParentProcesses = make_set(ParentProcess)
+  by ActorProcess, ActorPath, Account, NeverSeenBefore, RareGlobally
+| order by NeverSeenBefore desc, RareGlobally desc, TouchCount asc
