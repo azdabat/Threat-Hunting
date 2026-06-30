@@ -1,0 +1,421 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>THR-ROADMAP — Threat Hunting Roadmap (PEAK / TaHiTI / ABLE / ATT&CK)</title>
+<style>
+:root{
+  --bg:#0b0f10;
+  --panel:#11171a;
+  --panel2:#161d21;
+  --line:#243036;
+  --amber:#e8a23d;
+  --amber-dim:#7a5a26;
+  --cyan:#5fd1c7;
+  --red:#d9614f;
+  --text:#cdd8db;
+  --text-dim:#7f8e93;
+  --mono:'JetBrains Mono','SFMono-Regular',Consolas,monospace;
+  --sans:'Inter','Segoe UI',sans-serif;
+}
+*{box-sizing:border-box;}
+body{
+  margin:0; background:var(--bg); color:var(--text);
+  font-family:var(--sans); line-height:1.55;
+  background-image:
+    linear-gradient(var(--line) 1px, transparent 1px),
+    linear-gradient(90deg, var(--line) 1px, transparent 1px);
+  background-size:48px 48px;
+  background-attachment:fixed;
+}
+.wrap{max-width:1080px;margin:0 auto;padding:48px 28px 120px;}
+
+/* HEADER / SCAN-LINE HERO */
+header{
+  border:1px solid var(--line); background:var(--panel);
+  padding:28px 28px 24px; position:relative; overflow:hidden;
+  margin-bottom:36px;
+}
+header::before{
+  content:""; position:absolute; inset:0;
+  background:repeating-linear-gradient(0deg, rgba(95,209,199,0.025) 0px, rgba(95,209,199,0.025) 1px, transparent 1px, transparent 3px);
+  pointer-events:none;
+}
+.eyebrow{
+  font-family:var(--mono); font-size:11px; letter-spacing:.18em; color:var(--cyan);
+  text-transform:uppercase; display:flex; gap:10px; align-items:center;
+}
+.eyebrow .dot{width:6px;height:6px;border-radius:50%;background:var(--amber);box-shadow:0 0 8px var(--amber);}
+h1{
+  font-family:var(--mono); font-size:clamp(26px,4vw,38px); margin:10px 0 6px;
+  color:#f1f5f6; letter-spacing:-0.01em; font-weight:700;
+}
+.subtitle{color:var(--text-dim); font-size:14.5px; max-width:680px;}
+.framework-row{display:flex; gap:10px; flex-wrap:wrap; margin-top:18px;}
+.chip{
+  font-family:var(--mono); font-size:11.5px; padding:5px 10px; border:1px solid var(--amber-dim);
+  color:var(--amber); border-radius:2px; background:rgba(232,162,61,0.05);
+}
+
+/* SECTION HEADINGS */
+h2{
+  font-family:var(--mono); font-size:13px; letter-spacing:.14em; text-transform:uppercase;
+  color:var(--cyan); border-bottom:1px solid var(--line); padding-bottom:10px; margin:54px 0 20px;
+}
+h2 span.idx{color:var(--amber-dim); margin-right:10px;}
+p.lead{color:var(--text-dim); font-size:14.5px; max-width:760px; margin-bottom:22px;}
+
+/* TRIAD: PEAK + TAHITI + ABLE explainer */
+.triad{display:grid; grid-template-columns:repeat(3,1fr); gap:14px;}
+.triad .card{
+  background:var(--panel); border:1px solid var(--line); padding:16px 16px 14px;
+}
+.triad .card h3{
+  font-family:var(--mono); font-size:13px; color:#f1f5f6; margin:0 0 8px;
+  display:flex; align-items:center; gap:8px;
+}
+.triad .card h3 .tag{font-size:10px; color:var(--bg); background:var(--cyan); padding:2px 6px; border-radius:2px; font-weight:700;}
+.triad .card ol,{margin:0;padding-left:18px;}
+.triad .card ol{margin:8px 0 0; padding-left:18px; font-size:13px; color:var(--text-dim);}
+.triad .card ol li{margin-bottom:5px;}
+.triad .card ol li b{color:var(--text);}
+@media (max-width:780px){.triad{grid-template-columns:1fr;}}
+
+/* ABLE TABLE */
+.able-table{width:100%; border-collapse:collapse; margin-top:14px; font-size:13px;}
+.able-table th,.able-table td{border:1px solid var(--line); padding:9px 10px; text-align:left; vertical-align:top;}
+.able-table th{
+  font-family:var(--mono); font-size:10.5px; letter-spacing:.08em; text-transform:uppercase;
+  color:var(--amber); background:var(--panel2);
+}
+.able-table td{color:var(--text-dim);}
+.able-table td b{color:var(--text);}
+
+/* PHASE TIMELINE */
+.phase{
+  border:1px solid var(--line); background:var(--panel); margin-bottom:22px; position:relative;
+}
+.phase-head{
+  display:flex; align-items:center; justify-content:space-between; flex-wrap:wrap; gap:10px;
+  padding:16px 20px; border-bottom:1px solid var(--line); background:var(--panel2);
+}
+.phase-head .ph-left{display:flex; align-items:center; gap:14px;}
+.phase-num{
+  font-family:var(--mono); font-size:20px; color:var(--amber); border:1px solid var(--amber-dim);
+  width:42px; height:42px; display:flex; align-items:center; justify-content:center; flex-shrink:0;
+}
+.phase-head h3{margin:0; font-family:var(--mono); font-size:15px; color:#f1f5f6;}
+.phase-head .ph-meta{font-size:12px; color:var(--text-dim); margin-top:3px;}
+.priority{font-family:var(--mono); font-size:10.5px; padding:4px 9px; border-radius:2px; letter-spacing:.06em;}
+.p-critical{background:rgba(217,97,79,.12); color:var(--red); border:1px solid rgba(217,97,79,.4);}
+.p-high{background:rgba(232,162,61,.12); color:var(--amber); border:1px solid var(--amber-dim);}
+.p-standard{background:rgba(95,209,199,.1); color:var(--cyan); border:1px solid rgba(95,209,199,.35);}
+
+.hunts{padding:6px 20px 18px;}
+.hunt{
+  display:grid; grid-template-columns:120px 1fr 200px; gap:16px;
+  padding:14px 0; border-bottom:1px dashed var(--line);
+}
+.hunt:last-child{border-bottom:none;}
+.hunt .hid{font-family:var(--mono); font-size:12px; color:var(--amber); padding-top:2px;}
+.hunt .hbody h4{margin:0 0 4px; font-size:14.5px; color:#f1f5f6; font-weight:600;}
+.hunt .hbody p{margin:0; font-size:13px; color:var(--text-dim);}
+.hunt .hmeta{font-family:var(--mono); font-size:11px; color:var(--text-dim); text-align:right;}
+.hunt .hmeta div{margin-bottom:4px;}
+.hunt .hmeta .ttp{color:var(--cyan);}
+.hunt .hmeta .why{color:var(--text-dim);}
+@media (max-width:780px){
+  .hunt{grid-template-columns:1fr; gap:6px;}
+  .hunt .hmeta{text-align:left;}
+}
+
+/* CADENCE NOTE */
+.note{
+  border-left:3px solid var(--amber-dim); background:rgba(232,162,61,0.04);
+  padding:14px 18px; font-size:13.5px; color:var(--text-dim); margin:18px 0;
+}
+.note b{color:var(--amber);}
+
+footer{margin-top:60px; padding-top:20px; border-top:1px solid var(--line); font-family:var(--mono); font-size:11px; color:var(--text-dim);}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<header>
+  <div class="eyebrow"><span class="dot"></span>R&D / THREAT HUNTING PRACTICE — INTERNAL ROADMAP</div>
+  <h1>THR‑ROADMAP: Coverage‑First Threat Hunting Programme</h1>
+  <p class="subtitle">A phased hunt backlog built from the ATT&CK‑aligned hunt taxonomy, structured using PEAK (Prepare → Execute → Act with Knowledge), scoped with TaHiTI (Initiate → Hunt → Finalize), and hypothesised with the ABLE table (Actor, Behaviour, Location, Evidence). Ordered by realistic prevalence and impact across most environments — not by ATT&CK tactic order.</p>
+  <div class="framework-row">
+    <span class="chip">PEAK — Splunk SURGe</span>
+    <span class="chip">TaHiTI — FI‑ISAC NL</span>
+    <span class="chip">ABLE — Hypothesis Table</span>
+    <span class="chip">MITRE ATT&CK v15+</span>
+  </div>
+</header>
+
+<h2><span class="idx">00</span>How the three frameworks fit together</h2>
+<p class="lead">PEAK governs the lifecycle of a single hunt. TaHiTI governs how the hunt programme as a whole is fed, prioritised, and closed out against other security processes. ABLE is the hypothesis‑construction tool used inside PEAK's Prepare phase (and TaHiTI's Define/Refine step) to turn a vague idea into something testable. This roadmap nests all three: TaHiTI sets the backlog and triggers, PEAK runs each hunt, ABLE shapes each hypothesis before a query is ever written.</p>
+
+<div class="triad">
+  <div class="card">
+    <h3>PEAK <span class="tag">hunt lifecycle</span></h3>
+    <ol>
+      <li><b>Prepare</b> — select topic, research, build ABLE hypothesis, scope data</li>
+      <li><b>Execute</b> — query, pivot, correlate, confirm/refute</li>
+      <li><b>Act w/ Knowledge</b> — escalate, document, convert to detection, re‑seed backlog</li>
+    </ol>
+  </div>
+  <div class="card">
+    <h3>TaHiTI <span class="tag">programme flow</span></h3>
+    <ol>
+      <li><b>Initiate</b> — trigger (CTI, prior hunt, monitoring gap, IR, exec ask) → abstract → backlog</li>
+      <li><b>Hunt</b> — define/refine hypothesis, execute, validate (proven / disproven / inconclusive)</li>
+      <li><b>Finalize</b> — document, handover to IR/detection engineering/vuln mgmt/CTI</li>
+    </ol>
+  </div>
+  <div class="card">
+    <h3>ABLE <span class="tag">hypothesis table</span></h3>
+    <ol>
+      <li><b>Actor</b> — who/what is doing it (insider, commodity loader, ransomware affiliate)</li>
+      <li><b>Behaviour</b> — the specific TTP, mapped to an ATT&CK technique ID</li>
+      <li><b>Location</b> — host type, log source, network segment, identity tier</li>
+      <li><b>Evidence</b> — the artefact/telemetry that would prove or disprove it</li>
+    </ol>
+  </div>
+</div>
+
+<div class="note"><b>Worked ABLE example</b> — used as the template for every hunt card below: <i>Actor:</i> post‑exploitation operator with local admin. <i>Behaviour:</i> LSASS memory access for credential material (T1003.001). <i>Location:</i> domain‑joined workstations and Tier‑0/1 servers, Sysmon Event ID 10 + EDR process‑access telemetry. <i>Evidence:</i> non‑allow‑listed process opening lsass.exe with PROCESS_VM_READ, comsvcs.dll MiniDump invocation, or unsigned binary handle requests.</div>
+
+<h2><span class="idx">01</span>Roadmap structure &amp; prioritisation logic</h2>
+<p class="lead">Hunts are grouped into four delivery phases. Phase 1 covers the techniques that show up across nearly every intrusion regardless of actor sophistication (commodity malware, ransomware affiliates, APT alike) — these are funded first because they close the widest detection gap per hour invested. Later phases add precision, automation maturity (M‑ATH/baseline hunts), and lower‑frequency‑but‑high‑impact techniques. Every phase still runs the full PEAK cycle and feeds TaHiTI's Finalize handover into detection engineering.</p>
+
+<!-- PHASE 1 -->
+<div class="phase">
+  <div class="phase-head">
+    <div class="ph-left">
+      <div class="phase-num">01</div>
+      <div>
+        <h3>Foundational Coverage — Identity, Endpoint Tradecraft &amp; Initial Footholds</h3>
+        <div class="ph-meta">TaHiTI trigger: programme stand‑up + CTI baseline · Hunt type: hypothesis‑driven</div>
+      </div>
+    </div>
+    <span class="priority p-critical">CRITICAL — Run First</span>
+  </div>
+  <div class="hunts">
+    <div class="hunt">
+      <div class="hid">TH‑001</div>
+      <div class="hbody"><h4>LSASS credential dumping</h4><p>Process access to lsass.exe via comsvcs.dll, Task Manager dump, or known dumper tool signatures.</p></div>
+      <div class="hmeta"><div class="ttp">T1003.001 · Credential Access</div><div class="why">Near‑universal post‑exploit step</div></div>
+    </div>
+    <div class="hunt">
+      <div class="hid">TH‑002</div>
+      <div class="hbody"><h4>Kerberoasting / AS‑REP roasting</h4><p>Abnormal RC4 service‑ticket requests and bulk SPN enumeration against domain accounts.</p></div>
+      <div class="hmeta"><div class="ttp">T1558.003 · Credential Access</div><div class="why">Stealthy, AD‑native, high yield</div></div>
+    </div>
+    <div class="hunt">
+      <div class="hid">TH‑003</div>
+      <div class="hbody"><h4>Pass‑the‑Hash / abnormal NTLM relay</h4><p>NTLM authentications inconsistent with the source account's normal logon type, host, or time pattern.</p></div>
+      <div class="hmeta"><div class="ttp">T1550.002 · Lateral Movement</div><div class="why">Primary ransomware spread vector</div></div>
+    </div>
+    <div class="hunt">
+      <div class="hid">TH‑004</div>
+      <div class="hbody"><h4>Encoded/obfuscated PowerShell execution</h4><p>Base64 ‑EncodedCommand, IEX download‑cradles, and AMSI‑evasive script blocks via ScriptBlock logging.</p></div>
+      <div class="hmeta"><div class="ttp">T1059.001 · Execution</div><div class="why">Default tradecraft for loaders &amp; RATs</div></div>
+    </div>
+    <div class="hunt">
+      <div class="hid">TH‑005</div>
+      <div class="hbody"><h4>LOLBin proxy execution</h4><p>rundll32, mshta, regsvr32, certutil and msiexec invoked with network‑fetch or unusual parent processes.</p></div>
+      <div class="hmeta"><div class="ttp">T1218 · Defense Evasion</div><div class="why">Evades binary allow‑listing</div></div>
+    </div>
+    <div class="hunt">
+      <div class="hid">TH‑006</div>
+      <div class="hbody"><h4>Scheduled task &amp; run‑key persistence</h4><p>New/modified scheduled tasks and Run/RunOnce registry keys pointing at non‑standard paths or LOLBins.</p></div>
+      <div class="hmeta"><div class="ttp">T1053.005 / T1547.001 · Persistence</div><div class="why">Cheapest persistence to detect</div></div>
+    </div>
+    <div class="hunt">
+      <div class="hid">TH‑007</div>
+      <div class="hbody"><h4>Malicious browser extensions</h4><p>Sideloaded/unsigned extensions, abnormal manifest permissions (cookies, webRequest, all_urls), and extensions installed outside enterprise policy across Chromium and Firefox profiles.</p></div>
+      <div class="hmeta"><div class="ttp">T1176 · Persistence / C2</div><div class="why">Bypasses EDR, growing initial‑access path</div></div>
+    </div>
+    <div class="hunt">
+      <div class="hid">TH‑008</div>
+      <div class="hbody"><h4>Phishing execution chains</h4><p>Office/PDF child‑process spawn chains (winword.exe → wscript/powershell) following attachment open events.</p></div>
+      <div class="hmeta"><div class="ttp">T1566 / T1204.002 · Initial Access</div><div class="why">Most common observed entry point</div></div>
+    </div>
+    <div class="hunt">
+      <div class="hid">TH‑009</div>
+      <div class="hbody"><h4>AMSI bypass &amp; security tooling tamper</h4><p>AMSI patching, ETW provider unhooking, and EDR service/driver stop or uninstall events.</p></div>
+      <div class="hmeta"><div class="ttp">T1562.001 · Defense Evasion</div><div class="why">Precedes most successful breaches</div></div>
+    </div>
+  </div>
+</div>
+
+<!-- PHASE 2 -->
+<div class="phase">
+  <div class="phase-head">
+    <div class="ph-left">
+      <div class="phase-num">02</div>
+      <div>
+        <h3>Lateral Spread, Fileless Tradecraft &amp; C2 Channels</h3>
+        <div class="ph-meta">TaHiTI trigger: Phase 1 findings + CTI on active campaigns · Hunt type: hypothesis‑driven + baseline</div>
+      </div>
+    </div>
+    <span class="priority p-high">HIGH — Quarter 2</span>
+  </div>
+  <div class="hunts">
+    <div class="hunt">
+      <div class="hid">TH‑010</div>
+      <div class="hbody"><h4>WMI fileless execution &amp; remote exec</h4><p>Win32_Process Create calls, WMIC remote invocation, and ActiveScriptEventConsumer registrations.</p></div>
+      <div class="hmeta"><div class="ttp">T1047 · Execution / Lateral Movement</div><div class="why">Living‑off‑the‑land, log‑sparse</div></div>
+    </div>
+    <div class="hunt">
+      <div class="hid">TH‑011</div>
+      <div class="hbody"><h4>WMI event subscription persistence</h4><p>Permanent WMI consumers/filters/bindings created outside change windows.</p></div>
+      <div class="hmeta"><div class="ttp">T1546.003 · Persistence</div><div class="why">Survives reboot, rarely hunted</div></div>
+    </div>
+    <div class="hunt">
+      <div class="hid">TH‑012</div>
+      <div class="hbody"><h4>WinRM / PSRemoting abuse</h4><p>Unusual WinRM session origin pairs (workstation→DC, non‑admin jump host) and PSSession creation bursts.</p></div>
+      <div class="hmeta"><div class="ttp">T1021.006 · Lateral Movement</div><div class="why">Native admin tool, blends in</div></div>
+    </div>
+    <div class="hunt">
+      <div class="hid">TH‑013</div>
+      <div class="hbody"><h4>DCOM lateral execution</h4><p>MMC20.Application / ShellWindows DCOM invocation chains spawning child processes remotely.</p></div>
+      <div class="hmeta"><div class="ttp">T1021.003 · Lateral Movement</div><div class="why">No new process on source host</div></div>
+    </div>
+    <div class="hunt">
+      <div class="hid">TH‑014</div>
+      <div class="hbody"><h4>Service installation for persistence/lateral movement</h4><p>New service creation (sc.exe / PsExec‑pattern) with binPath pointing to temp/world‑writable paths.</p></div>
+      <div class="hmeta"><div class="ttp">T1543.003 · Persistence</div><div class="why">Classic PsExec‑style spread</div></div>
+    </div>
+    <div class="hunt">
+      <div class="hid">TH‑015</div>
+      <div class="hbody"><h4>Jittered/beaconing C2 traffic</h4><p>Statistical beaconing analysis on outbound connections — low‑variance interval, consistent payload size, long‑lived domains.</p></div>
+      <div class="hmeta"><div class="ttp">T1071 / T1573 · C2</div><div class="why">Catches novel C2 frameworks</div></div>
+    </div>
+    <div class="hunt">
+      <div class="hid">TH‑016</div>
+      <div class="hbody"><h4>DNS tunnelling &amp; exfiltration channels</h4><p>High‑entropy subdomains, abnormal TXT/NULL record volume, and per‑host DNS query‑rate outliers.</p></div>
+      <div class="hmeta"><div class="ttp">T1071.004 / T1048.003 · C2 / Exfil</div><div class="why">Frequently unmonitored egress path</div></div>
+    </div>
+    <div class="hunt">
+      <div class="hid">TH‑017</div>
+      <div class="hbody"><h4>SEO‑poisoning / malvertising installer delivery</h4><p>MSI/EXE downloads from newly‑registered or recently re‑categorised domains immediately following a browser search.</p></div>
+      <div class="hmeta"><div class="ttp">T1608.006 · Initial Access</div><div class="why">Rising commodity loader vector</div></div>
+    </div>
+    <div class="hunt">
+      <div class="hid">TH‑018</div>
+      <div class="hbody"><h4>Malicious document macro execution</h4><p>VBA AutoOpen/Document_Open chains invoking Shell, CreateObject(WScript.Shell), or network calls.</p></div>
+      <div class="hmeta"><div class="ttp">T1566.001 · Initial Access</div><div class="why">Still common in regulated sectors</div></div>
+    </div>
+  </div>
+</div>
+
+<!-- PHASE 3 -->
+<div class="phase">
+  <div class="phase-head">
+    <div class="ph-left">
+      <div class="phase-num">03</div>
+      <div>
+        <h3>Privilege Tiering, Anti‑Forensics &amp; Data Loss Paths</h3>
+        <div class="ph-meta">TaHiTI trigger: red‑team findings + sector CTI · Hunt type: hypothesis‑driven</div>
+      </div>
+    </div>
+    <span class="priority p-high">HIGH — Quarter 3</span>
+  </div>
+  <div class="hunts">
+    <div class="hunt">
+      <div class="hid">TH‑019</div>
+      <div class="hbody"><h4>BYOVD driver chains</h4><p>Loading of vulnerable, unsigned, or rarely‑seen kernel drivers immediately preceding EDR/AV process termination.</p></div>
+      <div class="hmeta"><div class="ttp">T1068 · Privilege Escalation</div><div class="why">Defeats EDR at kernel level</div></div>
+    </div>
+    <div class="hunt">
+      <div class="hid">TH‑020</div>
+      <div class="hbody"><h4>Token impersonation / theft</h4><p>DuplicateToken / SeDebugPrivilege use by non‑system processes to assume SYSTEM or admin context.</p></div>
+      <div class="hmeta"><div class="ttp">T1134 · Privilege Escalation</div><div class="why">Common tooling primitive (Mimikatz/Cobalt)</div></div>
+    </div>
+    <div class="hunt">
+      <div class="hid">TH‑021</div>
+      <div class="hbody"><h4>UAC bypass techniques</h4><p>Auto‑elevating binary abuse (fodhelper, eventvwr, sdclt) without an expected consent prompt.</p></div>
+      <div class="hmeta"><div class="ttp">T1548.002 · Privilege Escalation</div><div class="why">Silent elevation, no alert by default</div></div>
+    </div>
+    <div class="hunt">
+      <div class="hid">TH‑022</div>
+      <div class="hbody"><h4>DCSync &amp; NTDS.dit extraction</h4><p>Non‑DC accounts issuing directory‑replication requests, or volume‑shadow‑copy access to ntds.dit.</p></div>
+      <div class="hmeta"><div class="ttp">T1003.006 / T1003.003 · Credential Access</div><div class="why">Full domain compromise indicator</div></div>
+    </div>
+    <div class="hunt">
+      <div class="hid">TH‑023</div>
+      <div class="hbody"><h4>EDR blinding &amp; sensor tamper</h4><p>Local firewall rules blocking telemetry egress, callback‑hook removal, and ETW provider disablement.</p></div>
+      <div class="hmeta"><div class="ttp">T1562.001 / T1622 · Defense Evasion</div><div class="why">Directly threatens detection capability</div></div>
+    </div>
+    <div class="hunt">
+      <div class="hid">TH‑024</div>
+      <div class="hbody"><h4>Log clearing &amp; timestomping</h4><p>wevtutil cl events, Security log gaps, and MAC‑timestamp mismatches against $MFT/$USN.</p></div>
+      <div class="hmeta"><div class="ttp">T1070.001 / T1070.006 · Defense Evasion</div><div class="why">Anti‑forensic, hides IR timeline</div></div>
+    </div>
+    <div class="hunt">
+      <div class="hid">TH‑025</div>
+      <div class="hbody"><h4>RMM tool abuse for C2</h4><p>Legitimate remote‑management agents (AnyDesk, ScreenConnect, etc.) installed outside change records or used from unusual source geos.</p></div>
+      <div class="hmeta"><div class="ttp">T1219 · C2</div><div class="why">Living‑off‑trusted‑software, low AV hit rate</div></div>
+    </div>
+    <div class="hunt">
+      <div class="hid">TH‑026</div>
+      <div class="hbody"><h4>Data staging &amp; cloud upload exfiltration</h4><p>Bulk archive creation (rar/7z with password flags) followed by upload to personal cloud‑storage or file‑sharing domains.</p></div>
+      <div class="hmeta"><div class="ttp">T1074 / T1567.002 · Exfiltration</div><div class="why">Final‑stage ransomware double‑extortion step</div></div>
+    </div>
+  </div>
+</div>
+
+<!-- PHASE 4 -->
+<div class="phase">
+  <div class="phase-head">
+    <div class="ph-left">
+      <div class="phase-num">04</div>
+      <div>
+        <h3>Behavioural Baselines &amp; Model‑Assisted Hunting (M‑ATH)</h3>
+        <div class="ph-meta">TaHiTI trigger: programme maturity gate · Hunt type: baseline (EDA) + M‑ATH</div>
+      </div>
+    </div>
+    <span class="priority p-standard">STANDARD — Continuous</span>
+  </div>
+  <div class="hunts">
+    <div class="hunt">
+      <div class="hid">TH‑027</div>
+      <div class="hbody"><h4>Anomalous authentication baseline</h4><p>Per‑identity logon‑pattern modelling (time, source, protocol) to surface deviations across every tactic above, not just one technique.</p></div>
+      <div class="hmeta"><div class="ttp">Cross‑tactic · Baseline</div><div class="why">Catches unknown/novel TTPs</div></div>
+    </div>
+    <div class="hunt">
+      <div class="hid">TH‑028</div>
+      <div class="hbody"><h4>Process‑lineage outlier modelling</h4><p>Clustering of parent‑child process trees per host role to flag statistically rare execution chains.</p></div>
+      <div class="hmeta"><div class="ttp">Cross‑tactic · M‑ATH</div><div class="why">Generalises Phase 1–3 LOLBin hunts</div></div>
+    </div>
+    <div class="hunt">
+      <div class="hid">TH‑029</div>
+      <div class="hbody"><h4>Network egress volume &amp; destination baseline</h4><p>Per‑segment normal‑traffic modelling to flag exfil/C2 channels that evade signature‑based DNS/HTTP hunts.</p></div>
+      <div class="hmeta"><div class="ttp">Cross‑tactic · Baseline</div><div class="why">Backstop for TH‑015/016/026</div></div>
+    </div>
+    <div class="hunt">
+      <div class="hid">TH‑030</div>
+      <div class="hbody"><h4>Detection‑gap re‑hunt of closed findings</h4><p>Re‑run prior hunts against new data sources/log retention as coverage matures; primary engine for Act‑with‑Knowledge feedback.</p></div>
+      <div class="hmeta"><div class="ttp">Programme · Act/Knowledge</div><div class="why">Closes the PEAK feedback loop</div></div>
+    </div>
+  </div>
+</div>
+
+<h2><span class="idx">02</span>Cadence, ownership &amp; exit criteria</h2>
+<table class="able-table">
+  <tr><th>Stage</th><th>PEAK Phase</th><th>TaHiTI Phase</th><th>Exit Criteria</th></tr>
+  <tr><td><b>Programme stand‑up</b></td><td>Prepare</td><td>Initiate</td><td>Data source inventory complete, ABLE table template adopted, backlog seeded from Phase 1 hunts</td></tr>
+  <tr><td><b>Phase 1 execution</b></td><td>Execute</td><td>Hunt</td><td>All 9 hunts run at least once; ≥80% produce a documented finding, detection, or confirmed negative</td></tr>
+  <tr><td><b>Phase 2–3 execution</b></td><td>Execute</td><td>Hunt</td><td>Hunts scheduled on a recurring cadence (monthly/quarterly) tied to CTI triggers, not one‑off</td></tr>
+  <tr><td><b>Closeout</b></td><td>Act with Knowledge</td><td>Finalize</td><td>Findings converted to detections or playbooks; backlog re‑seeded; metrics reported to stakeholders</td></tr>
+  <tr><td><b>Phase 4 (continuous)</b></td><td>All three, looped</td><td>All three, looped</td><td>Baseline/M‑ATH models in place to catch deviations the technique‑specific hunts above were not built for</td></tr>
+</table>
+
+<footer>THR‑ROADMAP v1 · Source taxonomy: internal ATT&CK‑aligned mindmap · Frameworks: PEAK (Splunk SURGe), TaHiTI (FI‑ISAC NL), ABLE hypothesis table, MITRE ATT&CK Enterprise</footer>
+
+</div>
+</body>
+</html>
