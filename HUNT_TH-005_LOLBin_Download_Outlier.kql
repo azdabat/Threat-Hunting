@@ -1,0 +1,181 @@
+// ============================================================================
+// HUNT_TH-005 — LOLBin Download: Outlier Process Survey
+// ============================================================================
+// Author        : Ala Dabat
+// Date          : 2026-06-30
+// Status        : VALIDATED — mshta.exe confirmed as NeverSeenBefore finding
+// Type          : PEAK Hypothesis-Driven Hunt (rarity-baseline hybrid)
+// MITRE         : T1218 · T1105 · T1059 · T1197 · T1140
+//
+// Hypothesis: A process is downloading content via HTTP/FTP that is NOT in
+//             the router rule TargetProcs vocabulary — surfaced via
+//             rarity-baseline scoring rather than named-tool matching.
+//
+// Validated finding: mshta.exe — NeverSeenBefore=true — 2026-06-30
+//   Router rule updated: InitiatingProcessFileName =~ "mshta.exe" CRITICAL
+//   Composite candidate: COMPOSITE_T1218.005_MSHTA_DOWNLOAD
+//
+// Key design decisions vs router rule:
+// [HUNT-1] KnownLOLBins exclusion — hunt looks OUTSIDE router vocabulary
+// [HUNT-2] No threshold — output is ranked candidate list not alert
+// [HUNT-3] Rarity scoring — relative to environment history not absolute
+// [HUNT-4] Hunt alerts per finding — HuntAlert field for analyst action
+// [HUNT-5] No auto-playbook — conviction earned post-validation only
+// ============================================================================
+
+let Lookback = 30d;
+let RarityWindow = 90d;
+
+// Known vocabulary from router rule — hunt explicitly excludes these
+// Update this list each time a hunt finding is validated and added to router
+let KnownLOLBins = dynamic([
+    "bitsadmin.exe","certutil.exe","curl.exe","wget.exe",
+    "ftp.exe","tftp.exe","powershell.exe","mshta.exe"
+    // mshta.exe added 2026-06-30 after TH-005 validation
+]);
+
+// -----------------------------------------------------------------------
+// All download-intent events OUTSIDE the known LOLBin vocabulary
+// -----------------------------------------------------------------------
+let AllDownloadTouches =
+    DeviceProcessEvents
+    | where Timestamp >= ago(Lookback)
+    | where ProcessCommandLine has_any (
+        "http","https","ftp","download","urlcache",
+        "downloadfile","downloadstring","webclient",
+        "invoke-webrequest","iwr","bits","transfer"
+    )
+    | where FileName !in~ (KnownLOLBins)
+    | project
+        Timestamp,
+        DeviceName,
+        DeviceId,
+        ActorProcess  = FileName,
+        ActorPath     = InitiatingProcessFileName,
+        Account       = AccountName,
+        CommandLine   = ProcessCommandLine,
+        ParentProcess = InitiatingProcessFileName;
+
+// -----------------------------------------------------------------------
+// 90-day baseline — what has EVER downloaded content before the hunt window
+// -----------------------------------------------------------------------
+let HistoricalBaseline =
+    DeviceProcessEvents
+    | where Timestamp >= ago(RarityWindow)
+      and Timestamp < ago(Lookback)
+    | where ProcessCommandLine has_any (
+        "http","https","ftp","download","urlcache",
+        "downloadfile","downloadstring","webclient",
+        "invoke-webrequest","iwr","bits","transfer"
+    )
+    | where FileName !in~ (KnownLOLBins)
+    | summarize HistoricalCount = count()
+      by ActorProcess = FileName;
+
+// -----------------------------------------------------------------------
+// Rarity join + Hunt Alert generation per finding
+// -----------------------------------------------------------------------
+AllDownloadTouches
+| join kind=leftouter HistoricalBaseline on ActorProcess
+| extend
+    NeverSeenBefore = iif(isnull(HistoricalCount), true, false),
+    RareGlobally    = iif(HistoricalCount < 3, true, false)
+| summarize
+    FirstSeen       = min(Timestamp),
+    LastSeen        = max(Timestamp),
+    TouchCount      = count(),
+    DistinctDevices = dcount(DeviceName),
+    SampleCLI       = any(CommandLine),
+    ParentProcesses = make_set(ParentProcess)
+  by ActorProcess, ActorPath, Account, NeverSeenBefore, RareGlobally
+// -----------------------------------------------------------------------
+// HUNT ALERT — analyst action directive per finding
+// NOT an automated alert — guides Execute to Act with Knowledge handoff
+// -----------------------------------------------------------------------
+| extend HuntAlert = case(
+    // CRITICAL: Never seen before + spawned by suspicious parent
+    NeverSeenBefore == true
+        and ActorPath in~ ("cmd.exe","wscript.exe","cscript.exe",
+                           "winword.exe","excel.exe","outlook.exe","mshta.exe"),
+        strcat("CRITICAL -- ",
+               ActorProcess, " is downloading content and has NEVER been seen before. ",
+               "Parent: ", ActorPath, ". ",
+               "ACTION: Isolate ", ActorProcess,
+               " -- check for T1218 LOLBin abuse -- build composite rule. ",
+               "Add to router TargetProcs if confirmed malicious."),
+    // HIGH: Never seen before + unknown parent
+    NeverSeenBefore == true,
+        strcat("HIGH -- ",
+               ActorProcess, " is downloading content. Never seen in 90-day baseline. ",
+               "Parent: ", ActorPath, ". ",
+               "ACTION: Investigate ", ActorProcess,
+               " -- confirm legitimate use or escalate to composite build."),
+    // MEDIUM: Rare globally
+    RareGlobally == true,
+        strcat("MEDIUM -- ",
+               ActorProcess, " is downloading content. Rare in baseline (< 3 occurrences). ",
+               "Parent: ", ActorPath, ". ",
+               "ACTION: Review SampleCLI -- confirm not new tooling -- ",
+               "monitor for recurrence before escalating."),
+    // INFO: Present in baseline
+    strcat("INFO -- ",
+           ActorProcess, " downloading content. Present in baseline. ",
+           "ACTION: Review if CommandLine pattern has changed vs historical.")
+)
+// -----------------------------------------------------------------------
+// Router update directive — explicit instruction per novel finding
+// -----------------------------------------------------------------------
+| extend RouterUpdateRequired = case(
+    NeverSeenBefore == true,
+        strcat("ADD to router TargetProcs: \"", ActorProcess, "\" ",
+               "AND add routing case: ",
+               "InitiatingProcessFileName =~ \"", ActorProcess, "\", ",
+               "\"HIGH -- T1218 ", ActorProcess, " Composite | Build composite rule\""),
+    RareGlobally == true,
+        strcat("MONITOR: \"", ActorProcess,
+               "\" -- add to router if recurrence confirmed"),
+    "No router update required -- process present in baseline"
+)
+| project
+    FirstSeen,
+    LastSeen,
+    ActorProcess,
+    ActorPath,
+    Account,
+    NeverSeenBefore,
+    RareGlobally,
+    TouchCount,
+    DistinctDevices,
+    SampleCLI,
+    ParentProcesses,
+    HuntAlert,
+    RouterUpdateRequired
+| order by NeverSeenBefore desc, RareGlobally desc, TouchCount asc
+
+// ============================================================================
+// HOW TO USE THIS HUNT (PEAK / TaHiTI guidance)
+// ============================================================================
+// PEAK Prepare:
+//   1. Update KnownLOLBins with any new tools added to router since last run
+//   2. Adjust Lookback/RarityWindow to match environment data retention
+//
+// PEAK Execute:
+//   1. Run query -- review HuntAlert column for each row
+//   2. For CRITICAL/HIGH: expand SampleCLI and ParentProcesses
+//   3. Pivot on ActorProcess -- check DeviceNetworkEvents for outbound connections
+//   4. Confirm malicious or benign
+//
+// PEAK Act with Knowledge:
+//   1. CRITICAL confirmed -- execute RouterUpdateRequired directive
+//   2. Add ActorProcess to router TargetProcs
+//   3. File composite rule candidate in detection engineering backlog
+//   4. Add ActorProcess to KnownLOLBins in this hunt for next run
+//   5. Document finding in hunts/TH-005/findings/ as dated JSON
+//
+// TaHiTI Finalize:
+//   Proven       -- router update + composite candidate filed
+//   Disproven    -- add to KnownLOLBins with comment explaining legitimate use
+//   Inconclusive -- re-run with extended RarityWindow
+//
+// Sentinel variant: replace Timestamp with TimeGenerated throughout
+// ============================================================================
