@@ -1,0 +1,114 @@
+.create-merge table Table_0 (X:string) 
+.create-merge table DeviceProcessEvents (Timestamp:datetime, DeviceName:string, FileName:string, FolderPath:string, ProcessCommandLine:string, InitiatingProcessFileName:string, InitiatingProcessCommandLine:string, AccountName:string, ProcessToken:string, ReportId:long, InitiatingProcessParentFileName:string, DeviceId:string) 
+.create-merge table DeviceNetworkEvents (Timestamp:datetime, DeviceName:string, RemoteIP:string, RemotePort:int, RemoteUrl:string, LocalIP:string, InitiatingProcessFileName:string, ReportId:long, DeviceId:string, InitiatingProcessId:string, LocalPort:int, Protocol:string, ActionType:string) 
+.create-merge table DeviceFileEvents (Timestamp:datetime, DeviceName:string, FileName:string, FolderPath:string, ActionType:string, SHA256:string, InitiatingProcessFileName:string, ReportId:long, DeviceId:string) 
+.create-merge table DeviceRegistryEvents (Timestamp:datetime, DeviceName:string, RegistryKey:string, RegistryValueName:string, RegistryValueData:string, ActionType:string, InitiatingProcessFileName:string, ReportId:long, DeviceId:string, InitiatingProcessId:string) 
+.create-merge table DeviceLogonEvents (Timestamp:datetime, DeviceName:string, AccountName:string, LogonType:string, RemoteDeviceName:string, ReportId:long, DeviceId:string, RemoteIP:string) 
+.create-merge table SecurityEvent (Timestamp:datetime, Computer:string, EventID:int, Account:string, Activity:string, CommandLine:string) 
+.create-merge table SigninLogs (Timestamp:datetime, UserPrincipalName:string, IPAddress:string, Location:string, ResultType:string, AppDisplayName:string) 
+.create-merge table OfficeActivity (Timestamp:datetime, UserId:string, Operation:string, OfficeWorkload:string, ClientIP:string, ResultStatus:string) 
+.create-merge table IdentityDirectoryEvents (Timestamp:datetime, DeviceName:string, ActionType:string, TargetAccountDisplayName:string, DestinationDeviceName:string, ReportId:long) 
+.create-merge table ThreatIntelWatchlist (Timestamp:datetime, IndicatorType:string, IndicatorValue:string, Severity:string, Description:string) 
+.create-merge table RawEvents (TimeCreated:string, Id:int, Source:string, EventID:int, ProcessName:string, ParentProcessName:string, CommandLine:string, ImageLoaded:string, TargetObject:string, Details:string) 
+.create-merge table ProcessCreation (TimeGenerated:datetime, Computer:string, Account:string, ProcessName:string, ParentProcessName:string, CommandLine:string) 
+.create-merge table LsassHuntRaw (SubjectUserName:string, TimeCreated:datetime, SubjectLogonId:string, SubjectDomainName:string, EventID:int, Channel:string, Task:int, Message:string, Hostname:string, ProcessName:string, ProcessId:string, SourceName:string, ObjectName:string, ObjectType:string, AccessMask:string, AccessList:string, HandleId:string) 
+.create-merge table DeviceEvents (Timestamp:datetime, DeviceId:string, DeviceName:string, ActionType:string, FileName:string, FolderPath:string, SHA256:string, ProcessId:long, InitiatingProcessFileName:string, InitiatingProcessFolderPath:string, InitiatingProcessSHA256:string, InitiatingProcessAccountName:string, InitiatingProcessAccountDomain:string, InitiatingProcessId:long, InitiatingProcessParentFileName:string, AdditionalFields:string) 
+.create-or-alter function with (skipvalidation = "true") DeviceProcessEvents() {
+    RawEvents
+    | where EventID == 4688 or EventID == 1
+    | extend Timestamp = todatetime(TimeCreated)
+    | extend FileName = tostring(split(ProcessName, "\\")[-1])
+    | extend ProcessCommandLine = CommandLine
+    | extend InitiatingProcessFileName = tostring(split(ParentProcessName, "\\")[-1])
+    | extend DeviceName = "VM-Lab", DeviceId = "VM-001", AccountName = "LabUser"
+    | project Timestamp, DeviceName, DeviceId, AccountName, FileName, ProcessCommandLine, InitiatingProcessFileName
+}
+.create-or-alter function with (skipvalidation = "true") DeviceImageLoadEvents() {
+    RawEvents
+    | where EventID == 7
+    | extend Timestamp = todatetime(TimeCreated)
+    | extend FileName = tostring(split(ImageLoaded, "\\")[-1])
+    | extend FolderPath = tostring(ImageLoaded)
+    | extend InitiatingProcessFileName = tostring(split(ProcessName, "\\")[-1])
+    | extend DeviceName = "VM-Lab", DeviceId = "VM-001", AccountName = "LabUser"
+    | extend InitiatingProcessAccountName = AccountName // Fix: Map this so the rule doesn't crash
+    | project Timestamp, DeviceName, DeviceId, AccountName, InitiatingProcessAccountName, FileName, FolderPath, InitiatingProcessFileName
+}
+.create-or-alter function with (skipvalidation = "true") DeviceRegistryEvents() {
+    RawEvents
+    | where EventID in (12, 13, 14)
+    | extend Timestamp = todatetime(TimeCreated)
+    | extend RegistryKey = TargetObject
+    | extend RegistryValueData = Details
+    | extend RegistryValueName = "" 
+    | extend ActionType = case(EventID==12,"RegistryKeyCreated", EventID==13,"RegistryValueSet", "RegistryKeyDeleted")
+    | extend InitiatingProcessFileName = tostring(split(ProcessName, "\\")[-1])
+    | extend DeviceName = "VM-Lab", DeviceId = "VM-001", AccountName = "LabUser"
+    | extend InitiatingProcessAccountName = AccountName // Fix: Map this so the rule doesn't crash
+    | project Timestamp, DeviceName, DeviceId, AccountName, InitiatingProcessAccountName, RegistryKey, RegistryValueData, RegistryValueName, ActionType, InitiatingProcessFileName
+}
+.create-or-alter function with (skipvalidation = "true") DeviceNetworkEvents() {
+    RawEvents
+    | where EventID == 3 // If you exported Sysmon 3, this works. If not, it returns 0 rows but KEEPS schema.
+    | extend Timestamp = todatetime(TimeCreated)
+    | extend InitiatingProcessFileName = tostring(split(ProcessName, "\\")[-1])
+    | extend DeviceName = "VM-Lab", DeviceId = "VM-001"
+    | extend AccountName = "LabUser", AccountDomain = "LAB"
+    // --- The Safety Net (Fill dummy data if column is missing) ---
+    | extend RemoteIP = "0.0.0.0" 
+    | extend RemoteUrl = "" 
+    | extend RemotePort = 0
+    | extend LocalIP = "127.0.0.1"
+    | extend InitiatingProcessAccountName = AccountName
+    | project Timestamp, DeviceName, DeviceId, AccountName, AccountDomain,
+              RemoteIP, RemotePort, RemoteUrl, LocalIP,
+              InitiatingProcessFileName, InitiatingProcessAccountName
+}
+.create-or-alter function with (skipvalidation = "true") TransformLsassToMDE() {
+    LsassHuntRaw
+    | extend
+        Timestamp = TimeCreated,
+        DeviceId = tostring(Hostname),
+        DeviceName = tostring(Hostname),
+        ActionType = case(
+            EventID == 4663, "OpenProcessApiCall",
+            EventID == 4656, "AccessProcessHandle",
+            EventID == 4658, "CloseProcessHandle",
+            "ProcessEvent"
+        ),
+        FileName = iif(ObjectName has "lsass", "lsass.exe", ""),
+        FolderPath = tostring(ObjectName),
+        SHA256 = "",
+        ProcessId = toint(ProcessId),
+        InitiatingProcessFileName = tostring(split(ProcessName, "\\")[-1]),
+        InitiatingProcessFolderPath = tostring(ProcessName),
+        SHA256_init = "",
+        InitiatingProcessAccountName = tostring(SubjectUserName),
+        InitiatingProcessAccountDomain = tostring(SubjectDomainName),
+        InitiatingProcessId = toint(ProcessId),
+        InitiatingProcessParentFileName = "",
+        AdditionalFields = tostring(pack(
+            "AccessMask", AccessMask,
+            "ObjectName", ObjectName,
+            "HandleId", HandleId,
+            "EventID", EventID
+        ))
+    | project
+        Timestamp,
+        DeviceId,
+        DeviceName,
+        ActionType,
+        FileName,
+        FolderPath,
+        SHA256 = SHA256,
+        ProcessId = tolong(ProcessId),
+        InitiatingProcessFileName,
+        InitiatingProcessFolderPath,
+        InitiatingProcessSHA256 = SHA256_init,
+        InitiatingProcessAccountName,
+        InitiatingProcessAccountDomain,
+        InitiatingProcessId = tolong(InitiatingProcessId),
+        InitiatingProcessParentFileName,
+        AdditionalFields
+}
+.add table Table_0 admins (@'kusto=KustoServiceBuiltInPrincipal')
