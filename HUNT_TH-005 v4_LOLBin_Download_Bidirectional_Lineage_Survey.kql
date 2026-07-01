@@ -1,0 +1,209 @@
+// ============================================================================
+// HUNT_TH-005 v4 — LOLBin Download: Bidirectional Lineage Survey
+// ============================================================================
+// Enhancement over v3: bidirectional parent-child lineage analysis
+// v3 only checked: parent → actor (one direction)
+// v4 checks:
+//   [DIRECTION-1] actor as DOWNLOADER — novel process fetching content
+//   [DIRECTION-2] actor as CHILD of malicious LOLBin parent — 
+//                 known bad parent spawning unexpected child
+//   [DIRECTION-3] actor as PARENT spawning novel child —
+//                 catching post-download execution chain
+// ============================================================================
+
+let Lookback     = 200d;
+let RarityWindow = 400d;
+
+let KnownLOLBins = dynamic([
+    "bitsadmin.exe","certutil.exe","curl.exe","wget.exe",
+    "ftp.exe","tftp.exe","powershell.exe","mshta.exe"
+]);
+
+// Malicious LOLBin parents — processes known to spawn execution chains
+let MaliciousParents = dynamic([
+    "mshta.exe","wscript.exe","cscript.exe",
+    "winword.exe","excel.exe","outlook.exe",
+    "cmd.exe","rundll32.exe","regsvr32.exe"
+]);
+
+let DownloadKeywords = dynamic([
+    "http","https","ftp","download","urlcache",
+    "downloadfile","downloadstring","webclient",
+    "invoke-webrequest","iwr","bits","transfer",
+    "getobject","script:","javascript:"      // mshta-specific patterns added
+]);
+
+// -----------------------------------------------------------------------
+// DIRECTION 1 — Actor as novel DOWNLOADER (original TH-005 logic)
+// -----------------------------------------------------------------------
+let AllDownloadTouches =
+    DeviceProcessEvents
+    | where Timestamp >= ago(Lookback)
+    | where ProcessCommandLine has_any (DownloadKeywords)
+    | where FileName !in~ (KnownLOLBins)
+    | project
+        Timestamp,
+        DeviceName,
+        DeviceId,
+        ActorProcess  = FileName,
+        ActorPath     = InitiatingProcessFileName,
+        Account       = AccountName,
+        CommandLine   = ProcessCommandLine,
+        Direction     = "DOWNLOADER -- novel process fetching content";
+
+let HistoricalBaseline_Download =
+    DeviceProcessEvents
+    | where Timestamp >= ago(RarityWindow)
+      and Timestamp < ago(Lookback)
+    | where ProcessCommandLine has_any (DownloadKeywords)
+    | where FileName !in~ (KnownLOLBins)
+    | summarize HistoricalCount = count()
+      by ActorProcess = FileName;
+
+let Direction1 =
+    AllDownloadTouches
+    | join kind=leftouter HistoricalBaseline_Download on ActorProcess
+    | extend
+        NeverSeenBefore = iif(isnull(HistoricalCount), true, false),
+        RareGlobally    = iif(HistoricalCount < 3, true, false),
+        IsSuspParent    = toint(ActorPath in~ (MaliciousParents))
+    | summarize
+        FirstSeen       = min(Timestamp),
+        LastSeen        = max(Timestamp),
+        TouchCount      = count(),
+        DistinctDevices = dcount(DeviceName),
+        ParentProcesses = make_set(ActorPath, 10),
+        MaxIsSuspParent = max(IsSuspParent),
+        arg_max(Timestamp, CommandLine, ActorPath)
+      by ActorProcess, Account, NeverSeenBefore, RareGlobally, Direction
+    | extend SignalType = "D1_NOVEL_DOWNLOADER";
+
+// -----------------------------------------------------------------------
+// DIRECTION 2 — Actor as CHILD of malicious LOLBin parent
+// Known bad parent (mshta, wscript etc) spawning unexpected child
+// -----------------------------------------------------------------------
+let KnownChildBaseline =
+    DeviceProcessEvents
+    | where Timestamp >= ago(RarityWindow)
+      and Timestamp < ago(Lookback)
+    | where InitiatingProcessFileName in~ (MaliciousParents)
+    | summarize HistoricalChildCount = count()
+      by ParentProcess = InitiatingProcessFileName,
+         ChildProcess  = FileName;
+
+let Direction2 =
+    DeviceProcessEvents
+    | where Timestamp >= ago(Lookback)
+    | where InitiatingProcessFileName in~ (MaliciousParents)
+    | join kind=leftouter KnownChildBaseline
+        on $left.InitiatingProcessFileName == $right.ParentProcess
+        and $left.FileName == $right.ChildProcess
+    | extend
+        NeverSeenBefore = iif(isnull(HistoricalChildCount), true, false),
+        RareGlobally    = iif(HistoricalChildCount < 3, true, false)
+    | where NeverSeenBefore == true or RareGlobally == true
+    | summarize
+        FirstSeen       = min(Timestamp),
+        LastSeen        = max(Timestamp),
+        TouchCount      = count(),
+        DistinctDevices = dcount(DeviceName),
+        ParentProcesses = make_set(InitiatingProcessFileName, 10),
+        MaxIsSuspParent = toint(1),   // by definition — parent IS in MaliciousParents
+        arg_max(Timestamp, ProcessCommandLine, InitiatingProcessFileName)
+      by ActorProcess  = FileName,
+         Account       = AccountName,
+         NeverSeenBefore,
+         RareGlobally,
+         Direction     = "CHILD -- malicious parent spawning unexpected child"
+    | extend SignalType = "D2_MALICIOUS_PARENT_NOVEL_CHILD"
+    | project-rename CommandLine = ProcessCommandLine,
+                     ActorPath   = InitiatingProcessFileName;
+
+// -----------------------------------------------------------------------
+// DIRECTION 3 — Actor as PARENT spawning novel child
+// Catches post-download execution: mshta.exe → powershell.exe → C2
+// -----------------------------------------------------------------------
+let KnownSpawnBaseline =
+    DeviceProcessEvents
+    | where Timestamp >= ago(RarityWindow)
+      and Timestamp < ago(Lookback)
+    | where InitiatingProcessFileName in~ (KnownLOLBins)
+    | summarize HistoricalSpawnCount = count()
+      by LOLBinParent = InitiatingProcessFileName,
+         SpawnedChild = FileName;
+
+let Direction3 =
+    DeviceProcessEvents
+    | where Timestamp >= ago(Lookback)
+    | where InitiatingProcessFileName in~ (KnownLOLBins)
+    | join kind=leftouter KnownSpawnBaseline
+        on $left.InitiatingProcessFileName == $right.LOLBinParent
+        and $left.FileName == $right.SpawnedChild
+    | extend
+        NeverSeenBefore = iif(isnull(HistoricalSpawnCount), true, false),
+        RareGlobally    = iif(HistoricalSpawnCount < 3, true, false)
+    | where NeverSeenBefore == true or RareGlobally == true
+    | summarize
+        FirstSeen       = min(Timestamp),
+        LastSeen        = max(Timestamp),
+        TouchCount      = count(),
+        DistinctDevices = dcount(DeviceName),
+        ParentProcesses = make_set(InitiatingProcessFileName, 10),
+        MaxIsSuspParent = toint(1),
+        arg_max(Timestamp, ProcessCommandLine, InitiatingProcessFileName)
+      by ActorProcess  = FileName,
+         Account       = AccountName,
+         NeverSeenBefore,
+         RareGlobally,
+         Direction     = "CHILD_SPAWN -- LOLBin spawning novel child process"
+    | extend SignalType = "D3_LOLBIN_NOVEL_SPAWN"
+    | project-rename CommandLine = ProcessCommandLine,
+                     ActorPath   = InitiatingProcessFileName;
+
+// -----------------------------------------------------------------------
+// Union all three directions + Hunt Alert per finding
+// -----------------------------------------------------------------------
+union Direction1, Direction2, Direction3
+| extend HuntAlert = case(
+    NeverSeenBefore == true and MaxIsSuspParent == 1,
+        strcat("CRITICAL -- ", ActorProcess,
+               " [", SignalType, "] NEVER seen before. ",
+               "Suspicious parent/child context: ", ActorPath, ". ",
+               "CommandLine: ", substring(CommandLine, 0,
+                   iif(strlen(CommandLine) > 200, 200, strlen(CommandLine))),
+               ". ACTION: Isolate -- check full process tree -- build composite."),
+    NeverSeenBefore == true,
+        strcat("HIGH -- ", ActorProcess,
+               " [", SignalType, "] NEVER seen before. ",
+               "Parent: ", ActorPath,
+               ". ACTION: Investigate -- confirm legitimate use."),
+    RareGlobally == true,
+        strcat("MEDIUM -- ", ActorProcess,
+               " [", SignalType, "] rare in baseline (< 3). ",
+               "Parent: ", ActorPath,
+               ". ACTION: Monitor for recurrence."),
+    strcat("INFO -- ", ActorProcess, " [", SignalType, "] present in baseline.")
+)
+| extend RouterUpdateRequired = case(
+    NeverSeenBefore == true,
+        strcat("ADD to router TargetProcs: \"", ActorProcess,
+               "\" -- Signal: ", SignalType),
+    "MONITOR -- add if recurrence confirmed"
+)
+| project
+    FirstSeen,
+    LastSeen,
+    SignalType,
+    ActorProcess,
+    ActorPath,
+    Account,
+    Direction,
+    NeverSeenBefore,
+    RareGlobally,
+    TouchCount,
+    DistinctDevices,
+    CommandLine,
+    ParentProcesses,
+    HuntAlert,
+    RouterUpdateRequired
+| order by NeverSeenBefore desc, RareGlobally desc, TouchCount asc
