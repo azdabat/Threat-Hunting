@@ -1,0 +1,235 @@
+// ============================================================================
+// HUNT_TH-VPN-RMM — SELF-CONTAINED TEST HARNESS
+// ============================================================================
+// Purpose: Prove the detection logic works correctly BEFORE relying on real
+// Mordor lab data (which may not contain this exact attack pattern at all).
+//
+// How it works: `let DeviceProcessEvents = datatable(...)`, `let
+// IdentityLogonEvents = datatable(...)`, and `let SigninLogs = datatable(...)`
+// SHADOW the real tables of the same name for the scope of this query only.
+// Your production/lab tables are never touched. Everything below the
+// synthetic data block is the UNMODIFIED detection logic from HUNT_TH-VPN-RMM_v6.
+//
+// BUILT-IN TEST CASES:
+//   1. POSITIVE — user 'jsmith': 2 weeks of VPN logins from a known IP,
+//      then ONE login from a brand-new IP, followed 15 minutes later by a
+//      silent AnyDesk install. EXPECTED: fires as CRITICAL or HIGH.
+//   2. NEGATIVE — user 'bwayne': runs TeamViewer too, but ALWAYS from the
+//      same known IP (never a new one). EXPECTED: does NOT appear in results
+//      at all — proves the leftanti baseline join correctly excludes known-
+//      good behaviour rather than alerting on any RMM usage.
+//   3. NOISE — a plain chrome.exe execution for jsmith. EXPECTED: filtered
+//      out entirely by the RMM_Tools allowlist in Stage 1.
+//
+// If this harness produces exactly 1 row (jsmith, CRITICAL/HIGH) and 0 rows
+// for bwayne, the rule logic is proven correct end-to-end. Any "no rows" you
+// see against real Mordor tables afterward is a DATA gap, not a RULE bug.
+// ============================================================================
+
+// ── SYNTHETIC DATA: shadows real tables for this query only ────────────────
+let DeviceProcessEvents = datatable(
+    Timestamp: datetime,
+    DeviceName: string,
+    FileName: string,
+    ProcessCommandLine: string,
+    InitiatingProcessAccountName: string,
+    AccountName: string
+)
+[
+    // POSITIVE CASE: jsmith installs AnyDesk 15 min after new-IP VPN login
+    now(-45m), "WKSTN-JS01", "anydesk.exe",
+        "anydesk.exe /install /silent", "jsmith", "jsmith",
+
+    // NEGATIVE CASE: bwayne uses TeamViewer, but from a device tied to his
+    // always-known IP (excluded later at the VPN baseline stage, not here)
+    now(-2h), "WKSTN-BW01", "teamviewer.exe",
+        "teamviewer.exe", "bwayne", "bwayne",
+
+    // NOISE CASE: unrelated benign process for jsmith, must be filtered out
+    now(-50m), "WKSTN-JS01", "chrome.exe",
+        "chrome.exe --profile-directory=Default", "jsmith", "jsmith",
+];
+
+let IdentityLogonEvents = datatable(
+    Timestamp: datetime,
+    AccountName: string,
+    LogonType: string,
+    IPAddress: string,
+    Location: string
+)
+[
+    // jsmith baseline: known IP, logged in regularly for 2 weeks (outside Lookback)
+    now(-13d), "jsmith", "RemoteAccess", "10.0.0.50", "United Kingdom",
+    now(-9d),  "jsmith", "RemoteAccess", "10.0.0.50", "United Kingdom",
+    now(-4d),  "jsmith", "RemoteAccess", "10.0.0.50", "United Kingdom",
+
+    // jsmith SUSPICIOUS login: brand-new IP, inside Lookback (last 24h)
+    now(-1h), "jsmith", "RemoteAccess", "185.220.101.7", "Russia",
+
+    // bwayne baseline AND recent login: SAME known IP both times
+    // -> must be excluded by leftanti join (proves negative case works)
+    now(-12d), "bwayne", "RemoteAccess", "10.0.0.60", "United Kingdom",
+    now(-90m), "bwayne", "RemoteAccess", "10.0.0.60", "United Kingdom",
+];
+
+let SigninLogs = datatable(
+    TimeGenerated: datetime,
+    UserPrincipalName: string,
+    AppDisplayName: string,
+    ResourceDisplayName: string,
+    ClientAppUsed: string,
+    ResultType: int,
+    IPAddress: string,
+    LocationDetails: dynamic
+)
+[];  // empty — this test harness validates the IdentityLogonEvents path only
+
+// ============================================================================
+// DETECTION LOGIC BELOW — unmodified from HUNT_TH-VPN-RMM_v6.kql
+// ============================================================================
+
+let Lookback   = 24h;
+let History    = 14d;
+let RMMWindow  = 4h;
+
+let RMM_Tools = dynamic([
+    "anydesk.exe","teamviewer.exe","rustdesk.exe","screenconnect.client.exe",
+    "splashtop.exe","logmein.exe","ateraagent.exe","remoteutilities.exe",
+    "vncviewer.exe","realvnc.exe","tightvnc.exe","ultravnc.exe","supremo.exe",
+    "bomgar.exe","zohoassist.exe","gotoassist.exe","kaseyavsa.exe"
+]);
+
+// ── STAGE 1: RMM EXECUTION ───────────────────────────────────────────────────
+let RMMExec =
+    DeviceProcessEvents
+    | where Timestamp > ago(Lookback)
+    | where FileName in~ (RMM_Tools)
+        or (FileName =~ "msiexec.exe"
+            and ProcessCommandLine has_any ("anydesk","teamviewer","rustdesk",
+                                            "screenconnect","vnc","splashtop"))
+    | extend User = tolower(column_ifexists("InitiatingProcessAccountName",
+                             column_ifexists("AccountName", "")))
+    | extend RMMCmd_ = column_ifexists("ProcessCommandLine", "")
+    | extend DeviceName_ = column_ifexists("DeviceName", "")
+    | summarize
+        RMM_FirstTime = min(Timestamp),
+        RMM_LastTime  = max(Timestamp),
+        RMMTools      = make_set(FileName, 5),
+        arg_max(Timestamp, RMMCmd_, DeviceName_)
+      by User
+    | project-rename RMMCmd = RMMCmd_, DeviceName = DeviceName_;
+
+// ── STAGE 2: VPN LOGIN NORMALISATION ─────────────────────────────────────────
+let VPN_Identity =
+    IdentityLogonEvents
+    | where Timestamp > ago(History)
+    | where LogonType in ("RemoteInteractive","RemoteAccess","Network")
+    | project
+        EventTime = Timestamp,
+        User      = tolower(column_ifexists("AccountName",
+                             column_ifexists("TargetAccountName",
+                             column_ifexists("UserName", "")))),
+        IP        = IPAddress,
+        Location  = column_ifexists("Location", "Unknown");
+
+let VPN_SignIn =
+    SigninLogs
+    | where column_ifexists("TimeGenerated", Timestamp) > ago(History)
+    | where column_ifexists("AppDisplayName", "") has "VPN"
+        or column_ifexists("ResourceDisplayName", "") has "VPN"
+        or column_ifexists("ClientAppUsed", "") has "VPN"
+        or column_ifexists("NetworkLocationDetails", "") has "VPN"
+    | where column_ifexists("ResultType", 0) == 0
+    | extend Country = tostring(column_ifexists("LocationDetails", dynamic(null))["countryOrRegion"])
+    | project
+        EventTime = column_ifexists("TimeGenerated", Timestamp),
+        User      = tolower(column_ifexists("UserPrincipalName",
+                             column_ifexists("AccountName", ""))),
+        IP        = column_ifexists("IPAddress", ""),
+        Location  = Country;
+
+let VPN_All = union VPN_Identity, VPN_SignIn;
+
+// ── STAGE 3: BASELINE + NEW LOGIN DETECTION ───────────────────────────────────
+let Historical =
+    VPN_All
+    | where EventTime between (ago(History) .. ago(Lookback))
+    | distinct User, IP, Location;
+
+let Recent =
+    VPN_All
+    | where EventTime > ago(Lookback);
+
+let SuspiciousVPN =
+    Recent
+    | join kind=leftanti Historical on User, IP
+    | extend AnomalyReason = "NewIP_NeverSeenBefore"
+    | project
+        VPN_Time = EventTime,
+        User, IP, Location, AnomalyReason;
+
+// ── STAGE 4: CORRELATION VPN → RMM ───────────────────────────────────────────
+SuspiciousVPN
+| join kind=inner RMMExec on User
+| where (RMM_FirstTime - VPN_Time) between (0min .. RMMWindow)
+| extend
+    GapMinutes = datetime_diff("minute", RMM_FirstTime, VPN_Time)
+| extend
+    RiskScore =
+        60
+        + iif(RMMTools has_any ("anydesk.exe","rustdesk.exe"), 15, 0)
+        + iif(RMMCmd has_any ("install","setup","/quiet","/silent","msiexec"), 15, 0)
+        + iif(Location !in ("United Kingdom","US","United States",""), 10, 0)
+        + iif(GapMinutes <= 30, 10, 0)
+| extend HuntAlert = case(
+    RiskScore >= 90,
+        strcat("CRITICAL -- User '", User,
+               "' authenticated via NEW VPN IP ", IP, " [", Location, "] ",
+               "then installed/executed ", tostring(RMMTools),
+               " on '", DeviceName, "' within ", tostring(GapMinutes), " minutes. ",
+               "AkiraRansom/BlackBasta pattern. ",
+               "ACTION: 1. Verify user identity via out-of-band channel. ",
+               "2. Check IdentityLogonEvents for lateral movement after VPN. ",
+               "3. Check DeviceNetworkEvents for RMM outbound connections. ",
+               "4. Preserve forensic state before disabling account."),
+    RiskScore >= 75,
+        strcat("HIGH -- User '", User,
+               "' new VPN IP ", IP, " → RMM ", tostring(RMMTools),
+               " within ", tostring(GapMinutes), " minutes. ",
+               "ACTION: Validate with user. Check if planned remote access. ",
+               "Review recent email for phishing context."),
+    strcat("MEDIUM -- New VPN IP followed by RMM. ",
+           "User: ", User, ". IP: ", IP, ". Gap: ", tostring(GapMinutes), "min. ",
+           "ACTION: Confirm legitimate remote work scenario.")
+)
+| project
+    VPN_Time,
+    RMM_FirstTime,
+    GapMinutes,
+    User,
+    IP,
+    Location,
+    AnomalyReason,
+    RMMTools = tostring(RMMTools),
+    RMMCmd,
+    DeviceName,
+    RiskScore,
+    HuntAlert
+| order by RiskScore desc, GapMinutes asc
+
+// ============================================================================
+// EXPECTED RESULT:
+//   Exactly ONE row: User = jsmith, IP = 185.220.101.7, Location = Russia,
+//   GapMinutes = 15, RiskScore = 100 (60 base + 15 anydesk + 15 install-cmd
+//   + 10 non-safe-location + 10 fast-pivot), HuntAlert = CRITICAL.
+//   bwayne must NOT appear anywhere in the output.
+//
+// IF YOU GET 0 ROWS ON THIS HARNESS:
+//   The bug is in the detection logic itself, not in Mordor's data coverage —
+//   come back with the exact output (or lack of it) and we fix the real bug.
+// IF YOU GET THE EXPECTED 1 ROW:
+//   The rule is proven correct. Any "no rows" against real Mordor tables is
+//   confirmed to be a data-coverage gap, not a logic problem — safe to move
+//   on to sourcing/generating Mordor data that actually contains this
+//   attack chain, or to deploying the rule as-is against Sentinel/MDE.
+// ============================================================================

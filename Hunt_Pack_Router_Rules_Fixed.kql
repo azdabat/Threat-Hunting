@@ -1,0 +1,649 @@
+// ============================================================================
+// ROUTER RULE: Ingress Tool Transfer — Evasion-Aware (Hunt Pack 04/10 — Fixed)
+// Architecture : Router Rule (Architecture 2) — Triage Surface
+// Author       : Ala Dabat | MTDF 2026
+// Platform     : MDE Advanced Hunting — DeviceProcessEvents
+// Lifecycle    : Router (Temporary)
+// MITRE        : T1197 · T1140 · T1105 · T1059.001 · T1036
+//
+// WHY THIS IS A ROUTER RULE:
+// Seven LOLBin downloaders with seven different enterprise noise profiles.
+// bitsadmin noise = SCCM/Intune. certutil noise = PKI/dev tooling.
+// curl/wget noise = DevOps pipelines. PowerShell noise = everything.
+// One suppression model cannot cover all without creating blind spots.
+//
+// FIXES APPLIED vs ORIGINAL:
+// [FIX-1] any(ProcessCommandLine) → arg_max(Timestamp, *) — deterministic
+// [FIX-7] iif(bool, x, 0) → iff(flag == 1, x, 0) — explicit int comparison
+// [FIX-8] IsMasqueraded/HasScript/BadParent converted to toint()
+// [FIX-CIRCULAR] HasNet removed from scoring — duplicates Phase 1 filter
+// [FIX-DEADCODE] WeirdExport/IsPersistence/IsDownloader dead vars removed
+// [FIX-BURST] Hard burst suppression where not(...) replaced with soft penalty
+// [FIX-THRESHOLD] RiskScore >= 50 → >= 30 (correct router threshold)
+//
+// DECOMPOSITION STATUS:
+// ┌──────────────────────┬─────────────────────────────┬──────────────────────┐
+// │ Technique            │ Composite Status             │ Action               │
+// ├──────────────────────┼─────────────────────────────┼──────────────────────┤
+// │ bitsadmin /transfer  │ T1197 Composite — BUILT ✅   │ RETIRE from router   │
+// │ certutil -urlcache   │ T1140 Composite — pending 🔴 │ Keep in router       │
+// │ curl / wget -o       │ No composite yet             │ Keep in router       │
+// │ ftp / tftp transfer  │ No composite planned         │ Keep in router       │
+// │ PowerShell cradle    │ T1059.001 — BUILT ✅         │ RETIRE from router   │
+// │ IsMasqueraded signal │ T1036 — pending 🔴           │ Keep in router       │
+// └──────────────────────┴─────────────────────────────┴──────────────────────┘
+// ============================================================================
+
+let lookback = 7d;
+let TargetProcs = dynamic([
+    "certutil.exe","bitsadmin.exe","curl.exe","wget.exe",
+    "ftp.exe","tftp.exe","powershell.exe"
+]);
+let SuspiciousParents = dynamic([
+    "cmd.exe","winword.exe","excel.exe","outlook.exe",
+    "wscript.exe","cscript.exe","mshta.exe"
+]);
+let SuspiciousDirs = dynamic([
+    "\\Users\\Public","\\ProgramData","\\Windows\\Temp","\\Temp",
+    "\\Downloads","\\AppData\\Local\\Temp","\\AppData\\Roaming"
+]);
+let ManagedParents = dynamic([
+    "ccmexec.exe","intunemanagementextension.exe","wuauclt.exe","svchost.exe"
+]);
+
+// ── PHASE 1: BROAD SURFACE FILTER ──────────────────────────────────────────
+DeviceProcessEvents
+| where Timestamp > ago(lookback)
+| extend
+    FileLower = tolower(FileName),
+    OrigLower = tolower(tostring(column_ifexists("ProcessVersionInfoOriginalFileName",""))),
+    HasOrig   = isnotempty(tolower(tostring(
+                    column_ifexists("ProcessVersionInfoOriginalFileName",""))))
+| where FileLower in~ (TargetProcs) or (HasOrig and OrigLower in~ (TargetProcs))
+| where ProcessCommandLine has_any (
+    "http","https","ftp",
+    "-urlcache","-split","-f","decode",
+    "/transfer","/addfile","/setnotifycmdline","/resume",
+    " -o "," --output "," -OutFile ","--remote-name",
+    "invoke-webrequest","iwr","invoke-restmethod","irm",
+    "downloadstring","new-object net.webclient"
+)
+
+// ── PHASE 2: SIGNAL ENRICHMENT ──────────────────────────────────────────────
+// [FIX-8] All boolean flags wrapped in toint()
+| extend
+    IsMasqueraded   = toint(HasOrig and FileLower != OrigLower),
+    HasScript       = toint(ProcessCommandLine has_any (
+                        "downloadstring","iex","-enc","frombase64string")),
+    BadDLLPath      = toint(ProcessCommandLine has ".dll"
+                        and ProcessCommandLine has_any (SuspiciousDirs)),
+    BadParent       = toint(InitiatingProcessFileName in~ (SuspiciousParents)),
+    IsStagingPath   = toint(ProcessCommandLine has_any (SuspiciousDirs)),
+    IsManagedParent = toint(InitiatingProcessFileName in~ (ManagedParents))
+
+// ── PHASE 3: ROUTING SCORE ──────────────────────────────────────────────────
+// Base = 0 — router rule, signals build from zero
+// [FIX-CIRCULAR] HasNet NOT scored — it duplicates the Phase 1 filter
+// [FIX-7] Explicit iff(flag == 1, ...) throughout
+| extend RawScore = 0
+    + iff(IsMasqueraded == 1,   50, 0)  // Renamed binary — strongest signal
+    + iff(HasScript == 1,       25, 0)  // Download + exec chain
+    + iff(BadDLLPath == 1,      20, 0)  // DLL staged to writable path
+    + iff(BadParent == 1,       15, 0)  // Shell/Office spawn
+    + iff(IsStagingPath == 1,   10, 0)  // User-writable drop path
+    - iff(IsManagedParent == 1, 15, 0)  // Soft penalty — managed tooling
+
+// [FIX-10] Floor at zero — negative scores corrupt downstream SIEM
+| extend RiskScore = iif(RawScore < 0, 0, RawScore)
+
+// [FIX-THRESHOLD] Router threshold = 30, not 50
+| where RiskScore >= 30
+
+// ── PHASE 4: ROUTING DIRECTIVE ──────────────────────────────────────────────
+| extend RoutingDirective = case(
+    IsMasqueraded == 1,
+        "CRITICAL → T1036 Masquerading Composite | Renamed LOLBin confirmed",
+    FileLower =~ "bitsadmin.exe",
+        "HIGH → T1197 BITSAdmin Composite | Composite built — run it",
+    FileLower =~ "certutil.exe",
+        "HIGH → T1140 Certutil Composite | Composite pending — investigate",
+    FileLower in~ ("curl.exe","wget.exe"),
+        "HIGH → No composite yet | Engineer T1105 curl/wget composite",
+    HasScript == 1,
+        "HIGH → T1059.001 PowerShell Composite | Composite built — run it",
+    FileLower in~ ("ftp.exe","tftp.exe"),
+        "MEDIUM → No composite | Legacy transfer — investigate manually",
+    "MEDIUM → Ingress transfer intent | Route to appropriate composite"
+)
+
+// [FIX-1] arg_max — replaces any(ProcessCommandLine), deterministic output
+| summarize arg_max(Timestamp, *) by DeviceId, AccountName, FileName
+
+| project
+    Timestamp, DeviceName, AccountName, FileName,
+    ProcessCommandLine, InitiatingProcessFileName,
+    RiskScore, IsMasqueraded, HasScript, BadParent,
+    IsStagingPath, RoutingDirective
+| sort by RiskScore desc
+
+
+// ============================================================================
+// ROUTER RULE: AD & Domain Reconnaissance Surface (Hunt Pack 07/10 — Fixed)
+// Architecture : Router Rule (Architecture 2) — Triage Surface
+// Author       : Ala Dabat | MTDF 2026
+// Platform     : MDE Advanced Hunting — DeviceProcessEvents
+// Lifecycle    : Router (Temporary)
+// MITRE        : T1087 · T1069 · T1016 · T1033 · T1482 · T1018
+//
+// WHY THIS IS A ROUTER RULE:
+// dsquery/dsget/nltest are specialist AD tools — LOW noise, HIGH signal.
+// net.exe/net1.exe are used by everything in enterprise — EXTREME noise.
+// whoami/systeminfo are moderate noise — IT scripts use them constantly.
+// A composite that combines all three noise profiles cannot be tuned:
+// suppressing net.exe legitimate use creates blind spots in dsquery detection.
+//
+// FIXES APPLIED vs ORIGINAL:
+// [FIX-1] any(SampleCLI) → arg_max(Timestamp, *) — deterministic
+// [FIX-7] All iff() use explicit int comparisons
+// [FIX-8] All boolean flags wrapped in toint()
+// [FIX-+30] Hardcoded +30 mystery boost removed — replaced with structured signal
+// [FIX-BURST] Hard burst suppression replaced with soft penalty
+// [FIX-THRESHOLD] >= 50 → >= 30 (correct router threshold)
+// [FIX-DEADCODE] HasNet/IsDownloader/IsPersistence/WeirdExport dead vars removed
+//
+// DECOMPOSITION STATUS:
+// ┌──────────────────────┬─────────────────────────────┬──────────────────────┐
+// │ Technique            │ Composite Status             │ Action               │
+// ├──────────────────────┼─────────────────────────────┼──────────────────────┤
+// │ dsquery/dsget/nltest │ T1087/T1482 — pending 🔴     │ Keep in router       │
+// │ net.exe enum         │ T1069/T1087 — pending 🔴     │ Keep in router       │
+// │ whoami/systeminfo    │ T1033/T1016 — pending 🔴     │ Keep in router       │
+// └──────────────────────┴─────────────────────────────┴──────────────────────┘
+// ============================================================================
+
+let lookback = 7d;
+let ADTools = dynamic([
+    "dsquery.exe","dsget.exe","nltest.exe"
+]);
+let NetTools = dynamic([
+    "net.exe","net1.exe"
+]);
+let HostReconTools = dynamic([
+    "whoami.exe","systeminfo.exe"
+]);
+let AllTargetProcs = dynamic([
+    "dsquery.exe","dsget.exe","nltest.exe",
+    "net.exe","net1.exe","whoami.exe","systeminfo.exe"
+]);
+let SuspiciousParents = dynamic([
+    "cmd.exe","powershell.exe","pwsh.exe","wscript.exe","cscript.exe",
+    "winword.exe","excel.exe","outlook.exe"
+]);
+let SuspiciousDirs = dynamic([
+    "\\Users\\Public","\\ProgramData","\\Windows\\Temp","\\Temp",
+    "\\Downloads","\\AppData\\Local\\Temp","\\AppData\\Roaming"
+]);
+// Known IT/admin accounts — soft down-score, never hard exclude
+let KnownAdminPatterns = dynamic(["sccm","scom","backup","scan","monitor"]);
+
+// ── PHASE 1: BROAD SURFACE FILTER ──────────────────────────────────────────
+DeviceProcessEvents
+| where Timestamp > ago(lookback)
+| extend
+    FileLower = tolower(FileName),
+    OrigLower = tolower(tostring(column_ifexists("ProcessVersionInfoOriginalFileName",""))),
+    HasOrig   = isnotempty(tolower(tostring(
+                    column_ifexists("ProcessVersionInfoOriginalFileName",""))))
+| where FileLower in~ (AllTargetProcs) or (HasOrig and OrigLower in~ (AllTargetProcs))
+| where ProcessCommandLine has_any (
+    // AD-specific recon primitives
+    "dsquery","dsget","/dclist:","/domain_trusts",
+    "/trusted_domains","/dsgetdc:","-samid","-limit",
+    // Net command recon primitives
+    "user","group","localgroup","accounts","share",
+    "view","/all","/priv","/groups",
+    // Host recon
+    "systeminfo","/priv","/groups",
+    // Encoded execution chaining — recon tool used as loader
+    "-enc","frombase64string","iex"
+)
+
+// ── PHASE 2: SIGNAL ENRICHMENT ──────────────────────────────────────────────
+// [FIX-8] All boolean flags wrapped in toint()
+| extend
+    IsMasqueraded  = toint(HasOrig and FileLower != OrigLower),
+    IsADTool       = toint(FileLower in~ (ADTools) or OrigLower in~ (ADTools)),
+    IsNetTool      = toint(FileLower in~ (NetTools) or OrigLower in~ (NetTools)),
+    IsHostRecon    = toint(FileLower in~ (HostReconTools) or OrigLower in~ (HostReconTools)),
+    HasScript      = toint(ProcessCommandLine has_any ("-enc","frombase64string","iex")),
+    BadParent      = toint(InitiatingProcessFileName in~ (SuspiciousParents)),
+    BadDLLPath     = toint(ProcessCommandLine has ".dll"
+                        and ProcessCommandLine has_any (SuspiciousDirs)),
+    IsAdminAccount = toint(AccountName has_any (KnownAdminPatterns))
+
+// ── PHASE 3: ROUTING SCORE ──────────────────────────────────────────────────
+// Base = 0 — router rule, signals build from zero
+// AD tools score higher than net/whoami — less legitimate noise
+// [FIX-7] Explicit iff(flag == 1, ...) throughout
+| extend RawScore = 0
+    + iff(IsMasqueraded == 1,   50, 0)  // Renamed binary — highest priority
+    + iff(IsADTool == 1,        30, 0)  // Specialist AD tool — lower FP rate
+    + iff(HasScript == 1,       25, 0)  // Encoded execution via recon tool
+    + iff(BadParent == 1,       20, 0)  // Office/script parent spawn
+    + iff(IsNetTool == 1,       10, 0)  // Net command — very noisy, lower weight
+    + iff(IsHostRecon == 1,     10, 0)  // whoami/systeminfo — moderate noise
+    + iff(BadDLLPath == 1,      15, 0)  // DLL in suspicious path
+    - iff(IsAdminAccount == 1,  20, 0)  // Soft penalty — known admin account
+
+// [FIX-10] Floor at zero
+| extend RiskScore = iif(RawScore < 0, 0, RawScore)
+
+// [FIX-THRESHOLD] Router threshold = 30
+| where RiskScore >= 30
+
+// ── PHASE 4: ROUTING DIRECTIVE ──────────────────────────────────────────────
+| extend RoutingDirective = case(
+    IsMasqueraded == 1,
+        "CRITICAL → T1036 Masquerading Composite | Renamed recon tool confirmed",
+    IsADTool == 1 and BadParent == 1,
+        "HIGH → T1087/T1482 AD Recon Composite | Specialist tool from shell/Office parent",
+    IsADTool == 1,
+        "HIGH → T1087/T1482 AD Recon | dsquery/nltest execution — investigate context",
+    IsNetTool == 1 and BadParent == 1,
+        "HIGH → T1069/T1087 Net Enum | Net command from suspicious parent — pivot",
+    IsNetTool == 1,
+        "MEDIUM → T1069/T1087 Net Enum | Net command — baseline required before escalating",
+    IsHostRecon == 1 and BadParent == 1,
+        "MEDIUM → T1033/T1016 Host Recon | whoami/systeminfo from script parent",
+    "MEDIUM → Discovery surface | Investigate context and parent process"
+)
+
+// [FIX-1] arg_max — replaces any(), deterministic output
+| summarize arg_max(Timestamp, *) by DeviceId, AccountName, FileName
+
+| project
+    Timestamp, DeviceName, AccountName, FileName,
+    ProcessCommandLine, InitiatingProcessFileName,
+    RiskScore, IsMasqueraded, IsADTool, IsNetTool,
+    IsHostRecon, HasScript, BadParent, RoutingDirective
+| sort by RiskScore desc
+
+
+// ============================================================================
+// THREAT INTEL SENSOR: Tor Exit Node Connection
+// Architecture : Threat Intel Match — NOT a router rule, NOT a composite
+// Author       : Ala Dabat | MTDF 2026
+// Platform     : MDE Advanced Hunting — DeviceNetworkEvents
+// Lifecycle    : Always-on (intel feed dependent)
+// MITRE        : T1090 Proxy · T1071 App Layer Protocol · T1573 Encrypted Channel
+//
+// WHY THIS IS NOT A ROUTER RULE AND NOT A COMPOSITE:
+// A threat intel match has no minimum truth anchor in the MTDF sense.
+// The anchor IS the external data — known malicious infrastructure.
+// There is no noise domain question because any connection to a confirmed
+// Tor exit node warrants investigation regardless of process context.
+// This is a third rule category: Threat Intel Sensor.
+// Every hit is a finding. No threshold is required.
+//
+// FIXES APPLIED vs ORIGINAL:
+// [FIX-1] make_set(Cmds) — commands limited to prevent oversized sets
+// [FIX-STRUCTURE] HuntingDirectives → structured RoutingDirective format
+// [FIX-CLOSING] Missing closing ) added to original pack_array
+// ============================================================================
+
+let lookback = 7d;
+let TorExitNodes = externaldata(dest_ip: string)
+    ["https://raw.githubusercontent.com/mthcht/awesome-lists/main/Lists/TOR/only_tor_exit_nodes_IP_list.csv"]
+    with (format="csv", ignoreFirstRecord=true);
+let TorIPs = TorExitNodes | distinct dest_ip;
+
+// ── SURFACE FILTER ──────────────────────────────────────────────────────────
+DeviceNetworkEvents
+| where Timestamp > ago(lookback)
+| where RemoteIP in (TorIPs)
+
+// ── ENRICHMENT ──────────────────────────────────────────────────────────────
+| extend
+    Direction  = iif(ActionType == "ConnectionSuccess"
+                    and isnotempty(RemoteIP), "Outbound to Tor", "Connection to Tor"),
+    VT_Link    = strcat("https://www.virustotal.com/gui/ip-address/", RemoteIP)
+
+// ── AGGREGATION ─────────────────────────────────────────────────────────────
+// [FIX-1] make_set with size limits — prevents oversized dynamic columns
+| summarize
+    FirstSeen = min(Timestamp),
+    LastSeen  = max(Timestamp),
+    Count     = count(),
+    Processes = make_set(InitiatingProcessFileName, 20),
+    // [FIX-1] Cmds limited — full CLIs can be very long
+    Cmds      = make_set(substring(InitiatingProcessCommandLine, 0,
+                    min(strlen(InitiatingProcessCommandLine), 200)), 10),
+    Accounts  = make_set(InitiatingProcessAccountName, 10),
+    Ports     = make_set(RemotePort, 20)
+  by DeviceName, RemoteIP, Direction, VT_Link
+
+// ── INTEL DIRECTIVE ─────────────────────────────────────────────────────────
+| extend IntelDirective = strcat(
+    "TOR EXIT NODE | Device: ", DeviceName,
+    " | Direction: ", Direction,
+    " | Connections: ", tostring(Count),
+    " | Processes: ", tostring(Processes),
+    " | NEXT: Confirm Tor is not sanctioned for this user/team.",
+    " | NEXT: Pivot on process hashes across estate.",
+    " | NEXT: Review DeviceLogonEvents ±2h around FirstSeen.",
+    " | NEXT: VT check: ", VT_Link
+)
+| extend MITRE = "T1090 Proxy · T1071 Application Layer Protocol · T1573 Encrypted Channel"
+
+| project
+    FirstSeen, LastSeen, DeviceName, RemoteIP,
+    Direction, Count, Processes, Cmds, Accounts, Ports,
+    MITRE, IntelDirective
+| sort by Count desc
+
+
+// ============================================================================
+// ROUTER RULE: .NET Build/Compile LOLBin Execution (Hunt Pack 01/10 — Fixed)
+// Architecture : Router Rule (Architecture 2) — Triage Surface
+// Author       : Ala Dabat | MTDF 2026
+// Platform     : MDE Advanced Hunting — DeviceProcessEvents
+// Lifecycle    : Router (Temporary)
+// MITRE        : T1127 · T1218 · T1059
+//
+// WHY THIS IS A ROUTER RULE:
+// msbuild/csc/csi = developer build pipeline noise — HIGH enterprise baseline.
+// installutil/regasm = software deployment noise — different suppression.
+// ieexec = legacy IE execute — LOW noise, almost always suspicious.
+// pcwrun = Program Compatibility Wizard — very LOW noise.
+// Combining dev tooling noise with deployment tooling noise produces a
+// composite that cannot suppress one without blinding the other.
+//
+// FIXES APPLIED vs ORIGINAL:
+// [FIX-1] any(SampleCLI) → arg_max(Timestamp, *) — deterministic
+// [FIX-7] All iff() use explicit int comparisons
+// [FIX-8] All boolean flags wrapped in toint()
+// [FIX-BURST] Hard burst suppression replaced with soft penalty
+// [FIX-THRESHOLD] >= 50 → >= 30 (correct router threshold)
+// [FIX-DEADCODE] WeirdExport/IsPersistence dead vars removed
+// [FIX-CIRCULAR] HasNet not double-scored
+//
+// DECOMPOSITION STATUS:
+// ┌──────────────────────┬─────────────────────────────┬──────────────────────┐
+// │ Technique            │ Composite Status             │ Action               │
+// ├──────────────────────┼─────────────────────────────┼──────────────────────┤
+// │ msbuild inline C#    │ T1127.001 — pending 🔴       │ Keep in router       │
+// │ csc.exe compile      │ T1027/T1059 — pending 🔴     │ Keep in router       │
+// │ installutil proxy    │ T1218.004 — pending 🔴       │ Keep in router       │
+// │ regasm proxy         │ T1218.009 — pending 🔴       │ Keep in router       │
+// │ ieexec remote exec   │ T1218 variant — pending 🔴   │ Keep in router       │
+// │ pcwrun broker        │ T1218 variant — pending 🔴   │ Keep in router       │
+// └──────────────────────┴─────────────────────────────┴──────────────────────┘
+// ============================================================================
+
+let lookback = 7d;
+let DevTools = dynamic(["msbuild.exe","csc.exe","csi.exe"]);
+let DeployTools = dynamic(["installutil.exe","regasm.exe"]);
+let LowNoiseTools = dynamic(["ieexec.exe","pcwrun.exe"]);
+let AllTargetProcs = dynamic([
+    "msbuild.exe","csc.exe","csi.exe",
+    "ieexec.exe","installutil.exe","regasm.exe","pcwrun.exe"
+]);
+let SuspiciousParents = dynamic([
+    "cmd.exe","powershell.exe","pwsh.exe","wscript.exe","cscript.exe",
+    "winword.exe","excel.exe","outlook.exe","mshta.exe"
+]);
+let SuspiciousDirs = dynamic([
+    "\\Users\\Public","\\ProgramData","\\Windows\\Temp","\\Temp",
+    "\\Downloads","\\AppData\\Local\\Temp","\\AppData\\Roaming"
+]);
+// Known dev/build environments — soft down-score
+let KnownBuildAccounts = dynamic(["build","ci","devops","jenkins","github","runner"]);
+
+// ── PHASE 1: BROAD SURFACE FILTER ──────────────────────────────────────────
+DeviceProcessEvents
+| where Timestamp > ago(lookback)
+| extend
+    FileLower = tolower(FileName),
+    OrigLower = tolower(tostring(column_ifexists("ProcessVersionInfoOriginalFileName",""))),
+    HasOrig   = isnotempty(tolower(tostring(
+                    column_ifexists("ProcessVersionInfoOriginalFileName",""))))
+| where FileLower in~ (AllTargetProcs) or (HasOrig and OrigLower in~ (AllTargetProcs))
+| where ProcessCommandLine has_any (
+    // Build/compile primitives
+    ".csproj",".vbproj",".proj",".targets","/t:","/p:",
+    "-target:","-reference:","-r:","/unsafe","-out:",
+    ".csx","-script",
+    // Deployment primitives
+    ".application",".manifest",
+    "/u","uninstall","/logfile=","/logtoconsole","codebase","/tlb",
+    // PCWRun broker primitive
+    " -s ",
+    // Remote execution via ieexec
+    "http://","https://"
+)
+
+// ── PHASE 2: SIGNAL ENRICHMENT ──────────────────────────────────────────────
+// [FIX-8] All boolean flags wrapped in toint()
+| extend
+    IsMasqueraded   = toint(HasOrig and FileLower != OrigLower),
+    IsDevTool       = toint(FileLower in~ (DevTools) or OrigLower in~ (DevTools)),
+    IsDeployTool    = toint(FileLower in~ (DeployTools) or OrigLower in~ (DeployTools)),
+    IsLowNoiseTool  = toint(FileLower in~ (LowNoiseTools) or OrigLower in~ (LowNoiseTools)),
+    PcwRunBroker    = toint((FileLower == "pcwrun.exe" or OrigLower == "pcwrun.exe")
+                        and ProcessCommandLine has " -s "),
+    HasNet          = toint(ProcessCommandLine matches regex @"(?i)(http[s]?://|ftp://)"),
+    IsIEExecRemote  = toint((FileLower == "ieexec.exe" or OrigLower == "ieexec.exe")
+                        and ProcessCommandLine matches regex @"(?i)(http[s]?://|ftp://)"),
+    HasScript       = toint(ProcessCommandLine has_any (
+                        "-enc","frombase64string","iex","downloadstring")),
+    BadDLLPath      = toint((ProcessCommandLine has ".dll" or ProcessCommandLine has ".cpl")
+                        and ProcessCommandLine has_any (SuspiciousDirs)),
+    BadParent       = toint(InitiatingProcessFileName in~ (SuspiciousParents)),
+    IsBuildAccount  = toint(AccountName has_any (KnownBuildAccounts))
+
+// ── PHASE 3: ROUTING SCORE ──────────────────────────────────────────────────
+// Base = 0 — router rule, signals build from zero
+// [FIX-7] Explicit iff(flag == 1, ...) throughout
+| extend RawScore = 0
+    + iff(IsMasqueraded == 1,   50, 0)  // Renamed binary — strongest signal
+    + iff(PcwRunBroker == 1,    45, 0)  // PCWRun -s = execution broker abuse
+    + iff(IsIEExecRemote == 1,  40, 0)  // ieexec + remote URL = loader
+    + iff(HasNet == 1,          30, 0)  // Remote URL in .NET toolchain
+    + iff(HasScript == 1,       25, 0)  // Encoded/script execution
+    + iff(BadDLLPath == 1,      20, 0)  // DLL/CPL from staging path
+    + iff(BadParent == 1,       15, 0)  // Office/script parent
+    + iff(IsDeployTool == 1,    10, 0)  // Deployment tool context boost
+    - iff(IsDevTool == 1 and IsBuildAccount == 1, 20, 0)  // Soft: known dev env
+
+// [FIX-10] Floor at zero
+| extend RiskScore = iif(RawScore < 0, 0, RawScore)
+
+// [FIX-THRESHOLD] Router threshold = 30
+| where RiskScore >= 30
+
+// ── PHASE 4: ROUTING DIRECTIVE ──────────────────────────────────────────────
+| extend RoutingDirective = case(
+    IsMasqueraded == 1,
+        "CRITICAL → T1036 Masquerading Composite | Renamed .NET binary confirmed",
+    PcwRunBroker == 1,
+        "CRITICAL → T1218 PCWRun Composite | Execution broker -s flag confirmed | Pending composite",
+    IsIEExecRemote == 1,
+        "CRITICAL → T1218 ieexec Remote Exec | Remote URL execution confirmed | Pending composite",
+    HasNet == 1 and IsDeployTool == 1,
+        "HIGH → T1218.004/T1218.009 Deploy Tool Proxy | Remote exec via installutil/regasm",
+    HasNet == 1,
+        "HIGH → T1127 MSBuild/CSC Remote | Remote resource in build tool — investigate",
+    HasScript == 1,
+        "HIGH → T1059 Encoded Exec | Script/encoded primitive in .NET toolchain",
+    BadParent == 1,
+        "MEDIUM → .NET toolchain from suspicious parent | Pivot to parent process",
+    "MEDIUM → .NET toolchain activity | Review context and build environment"
+)
+
+// [FIX-1] arg_max — replaces any(), deterministic output
+| summarize arg_max(Timestamp, *) by DeviceId, AccountName, FileName
+
+| project
+    Timestamp, DeviceName, AccountName, FileName,
+    ProcessCommandLine, InitiatingProcessFileName,
+    RiskScore, IsMasqueraded, PcwRunBroker, IsIEExecRemote,
+    HasNet, HasScript, BadParent, RoutingDirective
+| sort by RiskScore desc
+
+
+// ============================================================================
+// ROUTER RULE: Script Proxy Execution Surface (Hunt Pack 02/10 — Fixed)
+// Architecture : Router Rule (Architecture 2) — Triage Surface
+// Author       : Ala Dabat | MTDF 2026
+// Platform     : MDE Advanced Hunting — DeviceProcessEvents
+// Lifecycle    : Router (Temporary)
+// MITRE        : T1218.005 · T1218.010 · T1218.011 · T1059.005 · T1216
+//
+// WHY THIS IS A ROUTER RULE:
+// mshta = legacy HTA apps and Group Policy scripts — different noise to rundll32.
+// regsvr32 = software install and COM registration — different noise to wscript.
+// wscript/cscript = enterprise automation scripts — VERY HIGH noise.
+// rundll32 = COM activation, print spooler — constant system noise.
+// Combining all in one composite means suppressing wscript/cscript
+// legitimate use which creates blind spots in rundll32 and mshta detection.
+//
+// FIXES APPLIED vs ORIGINAL:
+// [FIX-1] any(SampleCLI) → arg_max(Timestamp, *) — deterministic
+// [FIX-7] All iff() use explicit int comparisons
+// [FIX-8] All boolean flags wrapped in toint()
+// [FIX-BURST] Hard burst suppression replaced with soft penalty
+// [FIX-THRESHOLD] >= 50 → >= 30 (correct router threshold)
+// [FIX-DEADCODE] IsPersistence dead var removed
+// [FIX-CIRCULAR] IsDownloader scoring corrected — was double-scoring HasNet
+//
+// DECOMPOSITION STATUS:
+// ┌──────────────────────┬─────────────────────────────┬──────────────────────┐
+// │ Technique            │ Composite Status             │ Action               │
+// ├──────────────────────┼─────────────────────────────┼──────────────────────┤
+// │ mshta proxy exec     │ T1218.005 — pending 🔴       │ Keep in router       │
+// │ regsvr32 squiblydoo  │ T1218.010 — pending 🔴       │ Keep in router       │
+// │ rundll32 proxy       │ T1218.011 — pending 🔴       │ Keep in router       │
+// │ wscript/cscript      │ T1059.005 — pending 🔴       │ Keep in router       │
+// │ odbcconf SQLODBC     │ T1218.008 — pending 🔴       │ Keep in router       │
+// │ control.exe CPL      │ T1218.002 — pending 🔴       │ Keep in router       │
+// └──────────────────────┴─────────────────────────────┴──────────────────────┘
+// ============================================================================
+
+let lookback = 7d;
+let TargetProcs = dynamic([
+    "mshta.exe","regsvr32.exe","rundll32.exe",
+    "wscript.exe","cscript.exe","odbcconf.exe","control.exe"
+]);
+let SuspiciousParents = dynamic([
+    "cmd.exe","powershell.exe","pwsh.exe",
+    "winword.exe","excel.exe","outlook.exe","powerpnt.exe"
+]);
+let SuspiciousDirs = dynamic([
+    "\\Users\\Public","\\ProgramData","\\Windows\\Temp","\\Temp",
+    "\\Downloads","\\AppData\\Local\\Temp","\\AppData\\Roaming"
+]);
+// Known safe parents per binary — soft down-score
+let SafeRundll32Parents = dynamic(["spoolsv.exe","dllhost.exe","svchost.exe"]);
+let SafeRegsvr32Parents = dynamic(["msiexec.exe","setup.exe","install.exe"]);
+
+// ── PHASE 1: BROAD SURFACE FILTER ──────────────────────────────────────────
+DeviceProcessEvents
+| where Timestamp > ago(lookback)
+| extend
+    FileLower = tolower(FileName),
+    OrigLower = tolower(tostring(column_ifexists("ProcessVersionInfoOriginalFileName",""))),
+    HasOrig   = isnotempty(tolower(tostring(
+                    column_ifexists("ProcessVersionInfoOriginalFileName",""))))
+| where FileLower in~ (TargetProcs) or (HasOrig and OrigLower in~ (TargetProcs))
+| where ProcessCommandLine has_any (
+    "http","https","ftp",
+    "javascript","vbscript","scrobj","hta",
+    ".sct",".js",".jse",".vbs",".vbe",".wsf",
+    ".dll",".cpl",
+    "DllRegisterServer",
+    "regsvr",
+    "\\Users\\Public","\\ProgramData","\\Temp","\\AppData"
+)
+
+// ── PHASE 2: SIGNAL ENRICHMENT ──────────────────────────────────────────────
+// [FIX-8] All boolean flags wrapped in toint()
+| extend
+    IsMasqueraded   = toint(HasOrig and FileLower != OrigLower),
+    IsRundll32      = toint(FileLower == "rundll32.exe" or OrigLower == "rundll32.exe"),
+    IsRegsvr32      = toint(FileLower == "regsvr32.exe" or OrigLower == "regsvr32.exe"),
+    IsMshta         = toint(FileLower == "mshta.exe"    or OrigLower == "mshta.exe"),
+    IsWScript       = toint(FileLower in~ ("wscript.exe","cscript.exe")
+                        or OrigLower in~ ("wscript.exe","cscript.exe")),
+    HasNet          = toint(ProcessCommandLine matches regex @"(?i)(http[s]?://|ftp://)"),
+    HasScript       = toint(ProcessCommandLine has_any (
+                        "scrobj.dll","javascript:","vbscript:",
+                        "wscript.shell",".sct",".wsf")),
+    BadDLLPath      = toint((ProcessCommandLine has ".dll" or ProcessCommandLine has ".cpl")
+                        and ProcessCommandLine has_any (SuspiciousDirs)),
+    // [FIX-7] Explicit int — WeirdExport properly typed
+    WeirdExport     = toint(
+        (FileLower == "rundll32.exe" or OrigLower == "rundll32.exe")
+        and ProcessCommandLine matches regex
+            @"(?i),(#\d+|run|start|dllregisterserver|entry|main|shellexec_rundll)"),
+    BadParent       = toint(InitiatingProcessFileName in~ (SuspiciousParents)),
+    // [FIX-CIRCULAR] IsDownloader no longer just re-evaluates HasNet
+    // mshta/regsvr32 + remote URL = specific high-risk combination
+    IsRemoteProxy   = toint(
+        HasNet == 1
+        and (FileLower in~ ("mshta.exe","regsvr32.exe")
+             or OrigLower in~ ("mshta.exe","regsvr32.exe"))),
+    // Known-safe parents — soft penalty per binary type
+    IsKnownSafeParent = toint(
+        (IsRundll32 == 1 and InitiatingProcessFileName in~ (SafeRundll32Parents))
+        or (IsRegsvr32 == 1 and InitiatingProcessFileName in~ (SafeRegsvr32Parents)))
+
+// ── PHASE 3: ROUTING SCORE ──────────────────────────────────────────────────
+// Base = 0 — router rule, signals build from zero
+// [FIX-7] Explicit iff(flag == 1, ...) throughout
+| extend RawScore = 0
+    + iff(IsMasqueraded == 1,    50, 0)  // Renamed binary — strongest signal
+    + iff(IsRemoteProxy == 1,    35, 0)  // mshta/regsvr32 + remote URL
+    + iff(HasNet == 1,           25, 0)  // Any remote URL in script proxy
+    + iff(HasScript == 1,        25, 0)  // Script engine invocation
+    + iff(WeirdExport == 1,      20, 0)  // rundll32 unusual export
+    + iff(BadDLLPath == 1,       20, 0)  // DLL/CPL from staging path
+    + iff(BadParent == 1,        15, 0)  // Office/shell parent
+    - iff(IsKnownSafeParent == 1, 20, 0) // Soft: known-safe parent per binary
+
+// [FIX-10] Floor at zero
+| extend RiskScore = iif(RawScore < 0, 0, RawScore)
+
+// [FIX-THRESHOLD] Router threshold = 30
+| where RiskScore >= 30
+
+// ── PHASE 4: ROUTING DIRECTIVE ──────────────────────────────────────────────
+| extend RoutingDirective = case(
+    IsMasqueraded == 1,
+        "CRITICAL → T1036 Masquerading Composite | Renamed script proxy binary confirmed",
+    IsRegsvr32 == 1 and HasScript == 1,
+        "CRITICAL → T1218.010 regsvr32 Squiblydoo | Scriptlet execution confirmed | Pending composite",
+    IsMshta == 1 and HasNet == 1,
+        "HIGH → T1218.005 mshta Proxy | Remote HTA execution confirmed | Pending composite",
+    IsRundll32 == 1 and HasNet == 1,
+        "HIGH → T1218.011 rundll32 Proxy | Remote DLL loading confirmed | Pending composite",
+    IsRundll32 == 1 and WeirdExport == 1,
+        "HIGH → T1218.011 rundll32 Export Abuse | Unusual export invocation | Pending composite",
+    IsRegsvr32 == 1 and HasNet == 1,
+        "HIGH → T1218.010 regsvr32 Remote | Remote scriptlet — Pending composite",
+    BadParent == 1,
+        "HIGH → Script proxy from Office/shell parent | Pivot to parent process timeline",
+    BadDLLPath == 1,
+        "MEDIUM → DLL/CPL from staging path | Investigate binary and source",
+    "MEDIUM → Script proxy execution surface | Review command line and parent"
+)
+
+// [FIX-1] arg_max — replaces any(), deterministic output
+| summarize arg_max(Timestamp, *) by DeviceId, AccountName, FileName
+
+| project
+    Timestamp, DeviceName, AccountName, FileName,
+    ProcessCommandLine, InitiatingProcessFileName,
+    RiskScore, IsMasqueraded, IsRundll32, IsRegsvr32,
+    IsMshta, HasNet, HasScript, WeirdExport, BadParent,
+    RoutingDirective
+| sort by RiskScore desc

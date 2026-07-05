@@ -1,0 +1,394 @@
+// ============================================================================
+// TEST HARNESS: HUNT_SMB_PreExecution_Staging
+// Author: Ala Dabat | Date: 2026-07-05
+// Purpose: ADX-Docker synthetic validation of Hunt A logic
+//
+// HOW TO USE:
+//   Paste this ENTIRE file into one ADX query tab (Ctrl+A, delete first).
+//   Run it. Expected results are documented for each test case below.
+//   If results match expected → hunt logic is validated.
+//   If results don't match → the comment tells you exactly what broke.
+//
+// ============================================================================
+// TEST CASES
+// ============================================================================
+//
+// CASE 1: CRITICAL — AdminShareWrite + SMB precursor + unsigned + cmd.exe
+//   Host: VICTIM-01
+//   What: cmd.exe writes payload.exe to \\ADMIN$\, preceded by inbound SMB
+//   Expected: StagingType=AdminShareWrite | FinalScore=100 | Severity=CRITICAL
+//   Score breakdown: Base=50 + R1_SMB=25 + R2_Unsigned=10 + R3_SuspProc=15 = 100
+//
+// CASE 2: HIGH — ServiceRegistration + SMB precursor + unsigned writer
+//   Host: VICTIM-02
+//   What: powershell.exe registers service with ImagePath → C:\Temp\svc.exe
+//         preceded by inbound SMB, signer is empty (unsigned)
+//   Expected: StagingType=ServiceRegistration | FinalScore=90 | Severity=HIGH (>= 85 → CRITICAL actually)
+//   Score breakdown: Base=55 + R1_SMB=25 + R2_Unsigned=10 + R3_SuspProc=0 = 90 → CRITICAL
+//   NOTE: powershell.exe is in SuspiciousParents list so R3 also adds 15 → 105 → CRITICAL
+//   Correction: Base=55 + R1=25 + R2=10 + R3=15 = 105 → CRITICAL
+//
+// CASE 3: MEDIUM — AdminShareWrite, NO SMB precursor, signed writer
+//   Host: VICTIM-03
+//   What: explorer.exe writes payload.exe to \\ADMIN$\ — no SMB connection precedes it
+//         (could be local admin copy — suspicious but not confirmed remote)
+//   Expected: StagingType=AdminShareWrite | FinalScore=50 | Severity=MEDIUM
+//   Score breakdown: Base=50 + R1_SMB=0 + R2_Unsigned=0 (signed) + R3_SuspProc=0 = 50
+//
+// CASE 4: SUPPRESSED — Management tool writer (ccmexec.exe)
+//   Host: VICTIM-04
+//   What: ccmexec.exe writes a .exe to \\ADMIN$\ — this is SCCM doing its job
+//   Expected: ZERO ROWS — filtered by KnownManagementTools before reaching scoring
+//
+// CASE 5: SUPPRESSED — Non-executable file written to admin share
+//   Host: VICTIM-05
+//   What: cmd.exe writes readme.txt to \\ADMIN$\ — not an executable extension
+//   Expected: ZERO ROWS — filtered by ExecutableExtensions check
+//
+// CASE 6: SUPPRESSED — Service registration to safe path (Program Files)
+//   Host: VICTIM-06
+//   What: msiexec.exe registers service with ImagePath → C:\Program Files\App\svc.exe
+//         This is a legitimate installer — safe path, trusted signer
+//   Expected: ZERO ROWS — filtered because ImagePath does not has_any (WritablePaths)
+//
+// CASE 7: HIGH — ServiceRegistration + SMB, NO file drop (fileless path)
+//   Host: VICTIM-07
+//   What: cmd.exe registers service pointing to C:\ProgramData\evil.exe
+//         SMB connection precedes it — no file was actually dropped
+//         (attacker using an existing binary or planning future drop)
+//   Expected: StagingType=ServiceRegistration | FinalScore=95 | Severity=CRITICAL
+//   Score breakdown: Base=55 + R1_SMB=25 + R2_Unsigned=0 (no signer data) + R3_SuspProc=15 = 95
+//
+// CASE 8: TEMPORAL GAP — Staging occurred 5 days ago, no execution yet
+//   Host: VICTIM-08
+//   What: payload was staged 5 days ago (within 7d lookback)
+//         but composite (3d lookback) would have missed it entirely
+//   Expected: StagingType=AdminShareWrite | FinalScore=100 | Severity=CRITICAL
+//   This proves the temporal gap coverage — the composite (3d lookback) misses it
+// ============================================================================
+
+// ── CONFIGURATION (must match production hunt exactly) ────────────────────────
+
+let Lookback      = 7d;
+let CorrWindow    = 30m;
+
+let AdminShareMarkers = dynamic([
+    "\\ADMIN$\\", "\\C$\\", "\\IPC$\\",
+    "\\admin$\\", "\\c$\\",  "\\ipc$\\"
+]);
+
+let ExecutableExtensions = dynamic([
+    ".exe", ".dll", ".sys", ".bat",
+    ".ps1", ".vbs", ".js", ".hta"
+]);
+
+let WritablePaths = dynamic([
+    "\\Temp\\", "\\Windows\\Temp\\", "\\Users\\Public\\",
+    "\\ProgramData\\", "\\AppData\\"
+]);
+
+let KnownManagementTools = dynamic([
+    "ccmexec.exe", "sccmagent.exe", "intunemanagementextension.exe",
+    "taniumclient.exe", "qualysagent.exe"
+]);
+
+// ── SYNTHETIC DATA ────────────────────────────────────────────────────────────
+// datatable columns must match exactly what the production hunt projects.
+// Timestamps use MinutesAgo offset pattern (no function calls in datatable literals).
+
+// ── TABLE 1: DeviceFileEvents (shadows production table) ─────────────────────
+
+let DeviceFileEvents = datatable(
+    MinutesAgo:              long,
+    DeviceId:                string,
+    DeviceName:              string,
+    ActionType:              string,
+    FileName:                string,
+    FolderPath:              string,
+    InitiatingProcessFileName:      string,
+    InitiatingProcessCommandLine:   string,
+    InitiatingProcessSigner:        string,
+    InitiatingProcessAccountName:   string
+)[
+    // CASE 1: CRITICAL — cmd.exe drops payload.exe to ADMIN$ share
+    // Timestamp: 20 minutes ago
+    20,  "dev1", "VICTIM-01", "FileCreated",
+    "payload.exe", "\\\\SERVER\\ADMIN$\\payload.exe",
+    "cmd.exe", "cmd.exe /c copy payload.exe \\\\SERVER\\ADMIN$\\",
+    "", // unsigned — empty signer
+    "attacker",
+
+    // CASE 3: MEDIUM — explorer.exe drops to ADMIN$, no SMB precursor
+    // Signed writer, no suspicious process
+    60,  "dev3", "VICTIM-03", "FileCreated",
+    "payload.exe", "\\\\SERVER\\ADMIN$\\payload.exe",
+    "explorer.exe", "explorer.exe",
+    "Microsoft Corporation", // signed — R2 = 0
+    "user1",
+
+    // CASE 4: SUPPRESSED — ccmexec.exe drops .exe (SCCM — should be filtered)
+    30,  "dev4", "VICTIM-04", "FileCreated",
+    "softwareinstall.exe", "\\\\SERVER\\ADMIN$\\softwareinstall.exe",
+    "ccmexec.exe", "ccmexec.exe /install",
+    "Microsoft Corporation",
+    "SYSTEM",
+
+    // CASE 5: SUPPRESSED — cmd.exe drops .txt to ADMIN$ (not executable — filtered)
+    25,  "dev5", "VICTIM-05", "FileCreated",
+    "readme.txt", "\\\\SERVER\\ADMIN$\\readme.txt",
+    "cmd.exe", "cmd.exe /c copy readme.txt \\\\SERVER\\ADMIN$\\",
+    "",
+    "attacker",
+
+    // CASE 8: TEMPORAL GAP — staging happened 5 days ago (7200 minutes)
+    // Composite (3d lookback) misses this. Hunt (7d lookback) catches it.
+    7200, "dev8", "VICTIM-08", "FileCreated",
+    "backdoor.exe", "\\\\SERVER\\ADMIN$\\backdoor.exe",
+    "cmd.exe", "cmd.exe /c copy backdoor.exe \\\\SERVER\\ADMIN$\\",
+    "", // unsigned
+    "attacker"
+]
+| extend Timestamp = ago(MinutesAgo * 1m);
+
+// ── TABLE 2: DeviceRegistryEvents (shadows production table) ─────────────────
+
+let DeviceRegistryEvents = datatable(
+    MinutesAgo:              long,
+    DeviceId:                string,
+    DeviceName:              string,
+    ActionType:              string,
+    RegistryKey:             string,
+    RegistryValueName:       string,
+    RegistryValueData:       string,
+    InitiatingProcessFileName:      string,
+    InitiatingProcessCommandLine:   string,
+    InitiatingProcessSigner:        string,
+    InitiatingProcessAccountName:   string
+)[
+    // CASE 2: CRITICAL — powershell.exe registers service → Temp path
+    // R3 fires (powershell.exe is in suspicious parents)
+    18,  "dev2", "VICTIM-02", "RegistryValueSet",
+    "HKLM\\System\\CurrentControlSet\\Services\\EvilSvc",
+    "ImagePath",
+    "C:\\Temp\\svc.exe",
+    "powershell.exe", "powershell.exe -c New-Service -Name EvilSvc -BinaryPathName C:\\Temp\\svc.exe",
+    "", // unsigned
+    "attacker",
+
+    // CASE 6: SUPPRESSED — msiexec.exe registers service → Program Files (safe path)
+    45,  "dev6", "VICTIM-06", "RegistryValueSet",
+    "HKLM\\System\\CurrentControlSet\\Services\\LegitApp",
+    "ImagePath",
+    "C:\\Program Files\\LegitApp\\service.exe",  // NOT in WritablePaths — filtered
+    "msiexec.exe", "msiexec.exe /i LegitApp.msi",
+    "Microsoft Corporation",
+    "SYSTEM",
+
+    // CASE 7: HIGH/CRITICAL — cmd.exe registers service → ProgramData (fileless path)
+    // No corresponding file drop — tests fileless staging detection
+    22,  "dev7", "VICTIM-07", "RegistryValueSet",
+    "HKLM\\System\\CurrentControlSet\\Services\\StealthSvc",
+    "ImagePath",
+    "C:\\ProgramData\\evil.exe",
+    "cmd.exe", "sc.exe create StealthSvc binpath= C:\\ProgramData\\evil.exe",
+    "", // unsigned
+    "attacker"
+]
+| extend Timestamp = ago(MinutesAgo * 1m);
+
+// ── TABLE 3: DeviceNetworkEvents (shadows production table) ──────────────────
+// SMB precursor connections — must arrive BEFORE the staging event
+// (within CorrWindow = 30m)
+
+let DeviceNetworkEvents = datatable(
+    MinutesAgo:   long,
+    DeviceId:     string,
+    ActionType:   string,
+    LocalPort:    long,
+    RemoteIP:     string
+)[
+    // CASE 1: SMB connection 5 minutes before staging (20 min ago)
+    // Staging = 20min ago, SMB = 25min ago → within 30m window ✅
+    25,  "dev1", "InboundConnectionAccepted", 445, "10.10.10.50",
+
+    // CASE 2: SMB connection before VICTIM-02 staging
+    // Staging = 18min ago, SMB = 23min ago → within 30m window ✅
+    23,  "dev2", "InboundConnectionAccepted", 445, "10.10.10.50",
+
+    // CASE 3: NO SMB for VICTIM-03 — intentionally absent
+    // This proves R1_SMB = 0 and score stays at MEDIUM (50)
+
+    // CASE 7: SMB connection before VICTIM-07 fileless staging
+    // Staging = 22min ago, SMB = 27min ago → within 30m window ✅
+    27,  "dev7", "InboundConnectionAccepted", 445, "192.168.1.100",
+
+    // CASE 8: SMB connection before VICTIM-08 temporal gap staging
+    // Staging = 7200min ago, SMB = 7205min ago → within 30m window ✅
+    7205, "dev8", "InboundConnectionAccepted", 445, "10.10.10.50"
+]
+| extend Timestamp = ago(MinutesAgo * 1m);
+
+// ── HUNT LOGIC (exact copy from production — do not modify) ───────────────────
+
+let AdminShareWrites =
+    DeviceFileEvents
+    | where Timestamp >= ago(Lookback)
+    | where ActionType in ("FileCreated", "FileModified")
+    | where FolderPath has_any (AdminShareMarkers)
+    | where FileName has_any (ExecutableExtensions)
+    | where not(tolower(InitiatingProcessFileName) in~ (KnownManagementTools))
+    | project
+        DeviceId,
+        DeviceName,
+        StagingTime  = Timestamp,
+        StagingType  = "AdminShareWrite",
+        StagingFile  = FileName,
+        StagingPath  = FolderPath,
+        WriterProc   = InitiatingProcessFileName,
+        WriterCmd    = InitiatingProcessCommandLine,
+        WriterSigner = InitiatingProcessSigner,
+        WriterAcct   = InitiatingProcessAccountName;
+
+let ServiceRegistration =
+    DeviceRegistryEvents
+    | where Timestamp >= ago(Lookback)
+    | where ActionType == "RegistryValueSet"
+    | where RegistryKey has "\\System\\CurrentControlSet\\Services\\"
+    | where RegistryValueName =~ "ImagePath"
+    | where RegistryValueData has_any (WritablePaths)
+    | where not(tolower(InitiatingProcessFileName) in~ (KnownManagementTools))
+    | project
+        DeviceId,
+        DeviceName,
+        StagingTime  = Timestamp,
+        StagingType  = "ServiceRegistration",
+        StagingFile  = RegistryValueData,
+        StagingPath  = RegistryKey,
+        WriterProc   = InitiatingProcessFileName,
+        WriterCmd    = InitiatingProcessCommandLine,
+        WriterSigner = InitiatingProcessSigner,
+        WriterAcct   = InitiatingProcessAccountName;
+
+let StagingEvents = union AdminShareWrites, ServiceRegistration;
+
+let InboundSMBRPC =
+    DeviceNetworkEvents
+    | where Timestamp >= ago(Lookback)
+    | where ActionType == "InboundConnectionAccepted"
+    | where LocalPort in (445, 135)
+    | where isnotempty(RemoteIP)
+    | summarize
+        SMBCount   = count(),
+        SourceIPs  = make_set(RemoteIP, 10),
+        FirstSMB   = min(Timestamp),
+        LastSMB    = max(Timestamp)
+      by DeviceId;
+
+StagingEvents
+| join kind=leftouter (InboundSMBRPC) on DeviceId
+| extend SMBPreceded = isnotempty(SourceIPs)
+      and FirstSMB between ((StagingTime - CorrWindow) .. StagingTime)
+| extend
+    BaseScore   = case(
+        StagingType == "AdminShareWrite"   , 50,
+        StagingType == "ServiceRegistration", 55,
+        40
+    ),
+    R1_SMB      = iif(SMBPreceded, 25, 0),
+    R2_Unsigned = iif(WriterSigner == "" or WriterSigner == "Unknown", 10, 0),
+    R3_SuspProc = iif(tolower(WriterProc) in~ (
+        dynamic(["powershell.exe","cmd.exe","wscript.exe","mshta.exe","rundll32.exe"])
+    ), 15, 0)
+| extend FinalScore = BaseScore + R1_SMB + R2_Unsigned + R3_SuspProc
+| extend Severity = case(
+    FinalScore >= 85, "CRITICAL",
+    FinalScore >= 65, "HIGH",
+    FinalScore >= 50, "MEDIUM",
+    "LOW"
+  )
+| where Severity != "LOW"
+| extend HunterDirective = pack_array(
+    strcat("[MIN_TRUTH] StagingType=", StagingType,
+           " | File/Path=", StagingFile,
+           " | Writer=", WriterProc,
+           " | Account=", WriterAcct),
+    strcat("[SCORE] Final=", tostring(FinalScore), " | Severity=", Severity,
+           " | Base=", tostring(BaseScore),
+           " | SMBPrecursor=", tostring(R1_SMB),
+           " | UnsignedWriter=", tostring(R2_Unsigned),
+           " | SuspiciousProc=", tostring(R3_SuspProc)),
+    strcat("[SMB] SMBPreceded=", tostring(SMBPreceded),
+           " | SourceIPs=", tostring(SourceIPs),
+           " | SMBWindow=", tostring(FirstSMB), " → ", tostring(StagingTime)),
+    "[KILL_CHAIN] PRE-EXECUTION: Payload staged but services.exe has not yet spawned a child.",
+    "[ACTION_1] Check if services.exe has already spawned an uncommon child on this host.",
+    "[ACTION_2] Query DeviceRegistryEvents for service registrations near StagingTime.",
+    "[ACTION_3] Query SecurityEvent EventID 7045 on this host for the same window.",
+    "[ACTION_4] Pivot on SourceIPs — what else has this IP connected to?",
+    "[ACTION_5] If no execution yet: opportunity to block before composite fires.",
+    "[PIVOT] DeviceFileEvents | where DeviceName == <host> and FolderPath has_any (AdminShareMarkers)",
+    "[PIVOT] DeviceRegistryEvents | where DeviceName == <host> and RegistryKey has 'Services'",
+    "[PIVOT] DeviceProcessEvents | where DeviceName == <host> and InitiatingProcessFileName =~ 'services.exe'"
+)
+// ── VALIDATION LAYER ──────────────────────────────────────────────────────────
+// Adds expected result columns so you can verify at a glance.
+// Remove this section before deploying to production.
+| extend ExpectedSeverity = case(
+    DeviceName == "VICTIM-01", "CRITICAL",  // Base=50 + R1=25 + R2=10 + R3=15 = 100
+    DeviceName == "VICTIM-02", "CRITICAL",  // Base=55 + R1=25 + R2=10 + R3=15 = 105
+    DeviceName == "VICTIM-03", "MEDIUM",    // Base=50 + R1=0  + R2=0  + R3=0  = 50
+    DeviceName == "VICTIM-07", "CRITICAL",  // Base=55 + R1=25 + R2=10 + R3=15 = 105
+    DeviceName == "VICTIM-08", "CRITICAL",  // Base=50 + R1=25 + R2=10 + R3=15 = 100
+    "UNEXPECTED"
+)
+| extend ExpectedScore = case(
+    DeviceName == "VICTIM-01", 100,
+    DeviceName == "VICTIM-02", 105,
+    DeviceName == "VICTIM-03", 50,
+    DeviceName == "VICTIM-07", 105,
+    DeviceName == "VICTIM-08", 100,
+    -1
+)
+| extend ValidationResult = iif(
+    Severity == ExpectedSeverity and FinalScore == ExpectedScore,
+    "✅ PASS",
+    strcat("❌ FAIL — Expected: ", ExpectedSeverity, "/", tostring(ExpectedScore),
+           " | Got: ", Severity, "/", tostring(FinalScore))
+)
+| project
+    ValidationResult,
+    DeviceName,
+    StagingType,
+    StagingFile,
+    WriterProc,
+    WriterSigner,
+    SMBPreceded,
+    SourceIPs,
+    FinalScore,
+    ExpectedScore,
+    Severity,
+    ExpectedSeverity,
+    HunterDirective
+| order by DeviceName asc
+
+// ── EXPECTED OUTPUT ───────────────────────────────────────────────────────────
+//
+// You should see EXACTLY 5 rows:
+//
+// VICTIM-01 | AdminShareWrite  | payload.exe    | cmd.exe       | SMBPreceded=true  | Score=100 | CRITICAL ✅
+// VICTIM-02 | ServiceRegistration | C:\Temp\svc.exe | powershell.exe | SMBPreceded=true | Score=105 | CRITICAL ✅
+// VICTIM-03 | AdminShareWrite  | payload.exe    | explorer.exe  | SMBPreceded=false | Score=50  | MEDIUM   ✅
+// VICTIM-07 | ServiceRegistration | C:\ProgramData\evil.exe | cmd.exe | SMBPreceded=true | Score=105 | CRITICAL ✅
+// VICTIM-08 | AdminShareWrite  | backdoor.exe   | cmd.exe       | SMBPreceded=true  | Score=100 | CRITICAL ✅
+//
+// VICTIM-04: ZERO ROWS (ccmexec.exe filtered by KnownManagementTools)    ✅
+// VICTIM-05: ZERO ROWS (.txt filtered by ExecutableExtensions)            ✅
+// VICTIM-06: ZERO ROWS (Program Files not in WritablePaths)               ✅
+//
+// KEY VALIDATIONS:
+//   1. Suppression works: management tools, non-executables, safe paths = 0 rows
+//   2. MEDIUM fires without SMB: VICTIM-03 has no SMB, scores 50 = MEDIUM
+//   3. Fileless path fires: VICTIM-07 has no file drop but service registration ✅
+//   4. Temporal gap works: VICTIM-08 staged 5 days ago — composite (3d) misses,
+//      hunt (7d) catches = proves temporal gap coverage ✅
+//   5. All reinforcements compound correctly: R1+R2+R3 add independently ✅

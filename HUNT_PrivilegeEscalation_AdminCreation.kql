@@ -1,0 +1,407 @@
+// ============================================================================
+// THREAT HUNT SUITE: Privilege Escalation to Admin
+// Author: Ala Dabat | Date: 2026-07-05
+// MITRE: T1136.001 (Local Account), T1136.002 (Domain Account),
+//        T1078.002 (Valid Accounts: Domain), T1078.003 (Local Accounts)
+//        T1098 (Account Manipulation)
+//
+// RELATIONSHIP TO SMB LATERAL MOVEMENT COMPOSITE:
+//   The SMB_Service_Execution composite requires the attacker to have
+//   admin credentials to write to ADMIN$ and register services.
+//   These hunts detect HOW the attacker obtained those credentials —
+//   the step that enables everything downstream.
+//
+//   Full kill chain with these hunts:
+//
+//   [Initial Access]
+//         │
+//   [HUNT C1] New admin account created
+//   [HUNT C2] Existing account silently elevated to admin
+//   [HUNT C3] Dormant account suddenly performing admin activity
+//         │
+//   [Hunt A] Admin share staging
+//         │
+//   [Composite] Service execution (SMB lateral movement)
+//         │
+//   [Hunt B] Post-execution footprint
+//
+// WHY THREE SEPARATE HUNTS, NOT ONE:
+//   MTDF Rule 2: Split when noise domain changes.
+//   - New account creation (C1): noise from IT helpdesk / HR onboarding
+//   - Silent elevation (C2): noise from legitimate role changes / IT ops
+//   - Dormant account abuse (C3): noise from seasonal/project accounts
+//   Different suppression models required. Cannot be combined without
+//   creating blind spots in one to suppress noise in another.
+//
+// DATA SOURCES:
+//   SecurityEvent (Windows Event Log forwarded to Sentinel)
+//   DeviceLogonEvents (MDE)
+//   DeviceNetworkEvents (MDE)
+// ============================================================================
+
+
+// ============================================================================
+// HUNT C1: New Account Created AND Added to Admin Group
+// ============================================================================
+//
+// MINIMUM TRUTH:
+//   A new user account was created (Event 4720) AND within a correlation
+//   window that same account was added to a privileged group
+//   (Event 4732 = local admin, Event 4728 = domain group).
+//   Neither event alone is truth. Creation alone = normal IT activity.
+//   Group add alone = normal role change. Together = attacker establishing
+//   a persistent admin backdoor.
+//
+// WHY NOT COMPOSITE:
+//   Account creation + group add happens legitimately every time a new
+//   employee joins. The noise rate is too high for 24/7 alerting without
+//   strong contextual suppression. This is a periodic hunt that looks for
+//   anomalous creation patterns (outside business hours, by non-IT accounts,
+//   adding to privileged groups that normal users never join).
+//
+// COUSIN TECHNIQUES:
+//   - T1136.002: Domain account creation (same pattern, domain scope)
+//   - T1098.001: SSH authorized keys manipulation (different surface)
+//   - T1078.001: Default account abuse (no creation needed)
+// ============================================================================
+
+let Lookback     = 7d;
+let CorrWindow   = 30m; // Account created AND added to admin within 30 minutes
+
+// Privileged groups — local and domain
+let AdminGroups = dynamic([
+    "administrators","domain admins","enterprise admins",
+    "schema admins","group policy creator owners",
+    "account operators","backup operators","remote desktop users",
+    "network configuration operators","distributed com users"
+]);
+
+// Accounts that legitimately create users (suppress routine IT noise)
+// Tune this per tenant — keep tight
+let TrustedCreators = dynamic([
+    "svc_ad_provisioning","svc_hr_sync","azureadssoacc$"
+]);
+
+// Event 4720: User account created
+let AccountCreations =
+    SecurityEvent
+    | where TimeGenerated >= ago(Lookback)
+    | where EventID == 4720
+    | extend
+        NewAccount    = tostring(TargetUserName),
+        CreatedBy     = tostring(SubjectUserName),
+        CreatedOnHost = tostring(Computer)
+    | where not(tolower(CreatedBy) has_any (TrustedCreators))
+    | where not(NewAccount endswith "$")  // exclude machine accounts
+    | project
+        DeviceName    = tolower(CreatedOnHost),
+        CreationTime  = TimeGenerated,
+        NewAccount,
+        CreatedBy;
+
+// Event 4732: Member added to local security group
+// Event 4728: Member added to security-enabled global group (domain)
+let GroupAdditions =
+    SecurityEvent
+    | where TimeGenerated >= ago(Lookback)
+    | where EventID in (4732, 4728, 4756)
+    | extend
+        AddedAccount = tostring(TargetUserName),
+        GroupName    = tolower(tostring(TargetUserName)),
+        AddedBy      = tostring(SubjectUserName),
+        AddedOnHost  = tostring(Computer)
+    // Only care about privileged group additions
+    | extend GroupNameLower = tolower(tostring(MemberName))
+    | where GroupName has_any (AdminGroups)
+          or tostring(TargetUserName) has_any (AdminGroups)
+    | project
+        DeviceName   = tolower(AddedOnHost),
+        AddTime      = TimeGenerated,
+        AddedAccount,
+        GroupName    = tostring(TargetUserName),
+        AddedBy,
+        EventID;
+
+// Correlate: account created AND added to privileged group within window
+let Hunt_C1 =
+    AccountCreations
+    | join kind=inner (GroupAdditions) on DeviceName
+    | where AddedAccount =~ NewAccount
+    | where AddTime between (CreationTime .. CreationTime + CorrWindow)
+    | extend
+        BaseScore   = 65, // Both events together = strong signal
+        R1_OffHours = iif(hourofday(CreationTime) !between (7 .. 18), 20, 0),
+        R2_SameHost = iif(DeviceName == DeviceName, 10, 0),
+        R3_PrivGroup = iif(tolower(GroupName) in~ (
+            dynamic(["domain admins","enterprise admins","schema admins"])
+        ), 20, 0)
+    | extend FinalScore = BaseScore + R1_OffHours + R2_PrivGroup
+    | extend Severity = case(
+        FinalScore >= 100, "CRITICAL",
+        FinalScore >= 80,  "HIGH",
+        FinalScore >= 65,  "MEDIUM",
+        "LOW"
+    )
+    | where Severity != "LOW"
+    | extend HunterDirective = pack_array(
+        strcat("[MIN_TRUTH] NewAccount=", NewAccount,
+               " created by ", CreatedBy,
+               " then added to ", GroupName, " within ", tostring(CorrWindow)),
+        strcat("[SCORE] Final=", tostring(FinalScore), " | Severity=", Severity,
+               " | Base=65 | OffHours=", tostring(R1_OffHours),
+               " | PrivGroup=", tostring(R3_PrivGroup)),
+        "[KILL_CHAIN] Admin account creation. Attacker establishing persistent access or backdoor admin account.",
+        "[ACTION_1] Verify with IT/HR: was this account creation authorised and expected?",
+        "[ACTION_2] Check if NewAccount has been used to authenticate anywhere since creation.",
+        "[ACTION_3] Query DeviceLogonEvents for NewAccount logon activity post-creation.",
+        "[ACTION_4] If domain group: check all DCs for the group add — was it replicated?",
+        "[ACTION_5] Disable account immediately if unauthorised. Reset credentials for CreatedBy.",
+        strcat("[PIVOT] SecurityEvent | where TargetUserName == '", NewAccount, "' | EventID in (4624,4625,4648)"),
+        strcat("[PIVOT] DeviceLogonEvents | where AccountName == '", NewAccount, "'")
+    )
+    | extend HuntName = "C1_NewAdminAccountCreation"
+    | project
+        HuntName, CreationTime, Severity, FinalScore,
+        DeviceName, NewAccount, CreatedBy,
+        GroupName, AddedBy, AddTime,
+        HunterDirective;
+
+// ============================================================================
+// HUNT C2: Existing Account Silently Elevated to Admin
+// ============================================================================
+//
+// MINIMUM TRUTH:
+//   An existing user account (no corresponding Event 4720 in lookback)
+//   was added to a privileged group (Event 4732/4728) — AND this account
+//   has NO prior history of being in that group (first-time elevation).
+//   This is harder to detect than C1 because there's no creation event —
+//   an account that has existed for years quietly gains admin rights.
+//
+// WHY THIS IS HARDER AND MORE DANGEROUS THAN C1:
+//   - Account creation (C1) often triggers IT processes and approvals
+//   - Silent elevation (C2) can bypass those controls entirely
+//   - A user account suddenly becoming admin is a strong attacker indicator
+//   - This is the "insider threat or compromised account" pattern
+//
+// COUSIN TECHNIQUES:
+//   - T1098: Account Manipulation (modifying existing account)
+//   - T1078.002: Valid Accounts — Domain (compromised existing account)
+// ============================================================================
+
+let BaselineWindow = 30d; // How far back to check for "was already admin"
+
+// Accounts already in privileged groups (baseline — suppress these)
+let ExistingAdmins =
+    SecurityEvent
+    | where TimeGenerated between (ago(BaselineWindow) .. ago(Lookback))
+    | where EventID in (4732, 4728, 4756)
+    | extend AddedAccount = tostring(TargetUserName)
+    | where tostring(TargetUserName) has_any (AdminGroups)
+    | distinct AddedAccount;
+
+// New group additions in the hunt window
+let RecentGroupAdditions =
+    SecurityEvent
+    | where TimeGenerated >= ago(Lookback)
+    | where EventID in (4732, 4728, 4756)
+    | extend
+        AddedAccount = tostring(TargetUserName),
+        GroupName    = tostring(TargetUserName),
+        AddedBy      = tostring(SubjectUserName),
+        AddedOnHost  = tostring(Computer)
+    | where tostring(TargetUserName) has_any (AdminGroups)
+    | where not(tolower(AddedBy) has_any (TrustedCreators))
+    | where not(AddedAccount endswith "$") // exclude machine accounts
+    | project
+        DeviceName   = tolower(AddedOnHost),
+        ElevationTime = TimeGenerated,
+        AddedAccount,
+        GroupName    = tostring(TargetUserName),
+        AddedBy,
+        EventID;
+
+// Silent elevation: group add WITHOUT prior history of being in that group
+let Hunt_C2 =
+    RecentGroupAdditions
+    | join kind=leftanti (ExistingAdmins) on AddedAccount
+    // Also exclude if account was just created (that's C1's territory)
+    | join kind=leftanti (AccountCreations) on $left.AddedAccount == $right.NewAccount
+    | extend
+        BaseScore    = 70, // Silent elevation is inherently more suspicious
+        R1_OffHours  = iif(hourofday(ElevationTime) !between (7 .. 18), 20, 0),
+        R2_DomainPriv = iif(tolower(GroupName) in~ (
+            dynamic(["domain admins","enterprise admins","schema admins"])
+        ), 25, 0),
+        R3_SelfAdd   = iif(tolower(AddedBy) =~ tolower(AddedAccount), 30, 0) // account added ITSELF — very suspicious
+    | extend FinalScore = BaseScore + R1_OffHours + R2_DomainPriv + R3_SelfAdd
+    | extend Severity = case(
+        FinalScore >= 100, "CRITICAL",
+        FinalScore >= 80,  "HIGH",
+        FinalScore >= 70,  "MEDIUM",
+        "LOW"
+    )
+    | where Severity != "LOW"
+    | extend HunterDirective = pack_array(
+        strcat("[MIN_TRUTH] ExistingAccount=", AddedAccount,
+               " silently elevated to ", GroupName,
+               " by ", AddedBy, " — no prior history in this group"),
+        strcat("[SCORE] Final=", tostring(FinalScore), " | Severity=", Severity,
+               " | Base=70 | OffHours=", tostring(R1_OffHours),
+               " | DomainPriv=", tostring(R2_DomainPriv),
+               " | SelfAdd=", tostring(R3_SelfAdd)),
+        iif(R3_SelfAdd > 0,
+            "[CRITICAL_INDICATOR] Account added ITSELF to privileged group — near-certain attacker activity",
+            "[INDICATOR] Account elevated by third party — verify authorisation"),
+        "[KILL_CHAIN] Silent privilege escalation. Attacker using compromised account to gain persistent admin access.",
+        "[ACTION_1] Immediately verify with account owner and IT: was this change authorised?",
+        "[ACTION_2] Check what AddedAccount has done since the elevation: logons, network activity, file access.",
+        "[ACTION_3] Check AddedBy account: is it compromised? Review its recent activity.",
+        "[ACTION_4] Remove from privileged group immediately if unauthorised.",
+        "[ACTION_5] Reset both AddedAccount and AddedBy credentials.",
+        strcat("[PIVOT] SecurityEvent | where SubjectUserName == '", AddedBy, "' | last 7d — full activity"),
+        strcat("[PIVOT] DeviceLogonEvents | where AccountName == '", AddedAccount, "' | post-elevation logons")
+    )
+    | extend HuntName = "C2_SilentPrivilegeEscalation"
+    | project
+        HuntName, ElevationTime, Severity, FinalScore,
+        DeviceName, AddedAccount, GroupName,
+        AddedBy, EventID,
+        HunterDirective;
+
+// ============================================================================
+// HUNT C3: Dormant Admin Account Suddenly Active
+// ============================================================================
+//
+// MINIMUM TRUTH:
+//   An account that IS a member of a privileged group (it was already an
+//   admin) but has had ZERO logon activity in the last 30 days suddenly
+//   performs a network logon (Type 3) or interactive logon (Type 2).
+//   Dormant admin accounts are a prime attacker target — they often have
+//   weak passwords, no MFA, and no monitoring.
+//
+// WHY THIS IS A HUNT, NOT A COMPOSITE:
+//   Dormant accounts becoming active has legitimate explanations:
+//   seasonal workers returning, contractors resuming projects,
+//   emergency access accounts being used for genuine emergencies.
+//   The hunt surfaces the activity; the analyst determines legitimacy.
+//
+// WHAT THIS CATCHES:
+//   - Pass-the-Hash using a stolen admin hash (no password needed)
+//   - Credential stuffing against dormant admin accounts
+//   - Insider threat using a known-but-forgotten admin account
+//   - Attacker found credentials in a config file/script for an old admin
+//
+// COUSIN TECHNIQUES:
+//   - T1078.002: Valid Accounts — Domain Accounts
+//   - T1550.002: Pass-the-Hash (no logon needed, hash suffices)
+//   - T1110: Brute Force (dormant accounts often have weaker passwords)
+// ============================================================================
+
+let DormancyWindow  = 30d; // Account not seen for 30 days = dormant
+let ActivityWindow  = 7d;  // Hunt for sudden activity in last 7 days
+
+// Accounts with recent privileged group membership
+let AdminGroupMembers =
+    SecurityEvent
+    | where TimeGenerated >= ago(DormancyWindow)
+    | where EventID in (4732, 4728, 4756)
+    | extend AdminAccount = tostring(TargetUserName)
+    | where tostring(TargetUserName) has_any (AdminGroups)
+    | distinct AdminAccount;
+
+// Baseline: accounts that WERE active in the dormancy window
+// (before the activity window)
+let ActiveAccounts =
+    SecurityEvent
+    | where TimeGenerated between (ago(DormancyWindow) .. ago(ActivityWindow))
+    | where EventID == 4624 // successful logon
+    | extend ActiveAccount = tostring(TargetUserName)
+    | where not(ActiveAccount endswith "$")
+    | distinct ActiveAccount;
+
+// Recent logon activity in the hunt window
+let RecentLogons =
+    SecurityEvent
+    | where TimeGenerated >= ago(ActivityWindow)
+    | where EventID == 4624
+    | extend
+        LogonAccount = tostring(TargetUserName),
+        LogonType    = toint(LogonType),
+        LogonHost    = tostring(Computer),
+        SourceIP     = tostring(IpAddress)
+    | where not(LogonAccount endswith "$")
+    | where LogonType in (2, 3, 10) // Interactive, Network, RemoteInteractive
+    | project
+        DeviceName   = tolower(LogonHost),
+        LogonTime    = TimeGenerated,
+        LogonAccount,
+        LogonType,
+        SourceIP;
+
+// Dormant admin suddenly active: admin group member + no prior activity + sudden logon
+let Hunt_C3 =
+    RecentLogons
+    | join kind=inner (AdminGroupMembers) on $left.LogonAccount == $right.AdminAccount
+    | join kind=leftanti (ActiveAccounts) on $left.LogonAccount == $right.ActiveAccount
+    | extend
+        BaseScore      = 60,
+        R1_NetworkLogon = iif(LogonType == 3, 25, 0), // Type 3 = network logon = remote access
+        R2_OffHours    = iif(hourofday(LogonTime) !between (7 .. 18), 15, 0),
+        R3_ExternalIP  = iif(isnotempty(SourceIP)
+                         and not(ipv4_is_private(SourceIP))
+                         and SourceIP != "-", 30, 0), // external IP = very suspicious
+        R4_Weekend     = iif(dayofweek(LogonTime) in (0d, 6d), 10, 0)
+    | extend FinalScore = BaseScore + R1_NetworkLogon + R2_OffHours + R3_ExternalIP + R4_Weekend
+    | extend Severity = case(
+        FinalScore >= 100, "CRITICAL",
+        FinalScore >= 80,  "HIGH",
+        FinalScore >= 60,  "MEDIUM",
+        "LOW"
+    )
+    | where Severity != "LOW"
+    | extend HunterDirective = pack_array(
+        strcat("[MIN_TRUTH] DormantAdminAccount=", LogonAccount,
+               " | LogonType=", tostring(LogonType),
+               " | SourceIP=", SourceIP,
+               " | No activity in last ", tostring(DormancyWindow)),
+        strcat("[SCORE] Final=", tostring(FinalScore), " | Severity=", Severity,
+               " | Base=60 | NetworkLogon=", tostring(R1_NetworkLogon),
+               " | OffHours=", tostring(R2_OffHours),
+               " | ExternalIP=", tostring(R3_ExternalIP),
+               " | Weekend=", tostring(R4_Weekend)),
+        iif(R3_ExternalIP > 0,
+            strcat("[CRITICAL_INDICATOR] Admin logon from EXTERNAL IP: ", SourceIP,
+                   " — dormant admin accessed from outside network"),
+            iif(R1_NetworkLogon > 0,
+                "[HIGH_INDICATOR] Network logon (Type 3) — remote access using admin credentials",
+                "[INDICATOR] Interactive logon from dormant admin account")),
+        "[KILL_CHAIN] Dormant admin account activated. Attacker likely obtained credentials via credential dumping, config file discovery, or Pass-the-Hash.",
+        "[ACTION_1] Contact the account owner immediately — did they initiate this logon?",
+        "[ACTION_2] If no legitimate owner: account may be an orphaned admin — disable immediately.",
+        "[ACTION_3] Check for preceding credential theft events: LSASS access, SAM dump, Kerberoasting on this or related hosts.",
+        "[ACTION_4] If Pass-the-Hash suspected: check for Logon Type 3 without prior Type 2 (no interactive session exists).",
+        "[ACTION_5] Review all activity from LogonAccount since LogonTime — what did it access?",
+        strcat("[PIVOT] DeviceLogonEvents | where AccountName == '", LogonAccount, "' | all post-logon activity"),
+        strcat("[PIVOT] DeviceNetworkEvents | where InitiatingProcessAccountName == '", LogonAccount, "' | SMB/RPC connections"),
+        strcat("[PIVOT] SecurityEvent | where IpAddress == '", SourceIP, "' | other accounts from same source IP")
+    )
+    | extend HuntName = "C3_DormantAdminSuddenlyActive"
+    | project
+        HuntName, LogonTime, Severity, FinalScore,
+        DeviceName, LogonAccount, LogonType,
+        SourceIP, HunterDirective;
+
+// ============================================================================
+// COMBINED OUTPUT — all three hunts in one result set
+// ============================================================================
+//
+// Each hunt fires independently. Union surfaces all three together
+// so an analyst can see the full privilege escalation picture at once.
+//
+// If multiple hunts fire for the same account/host — that is the most
+// important finding: an attacker who created a new admin (C1), elevated
+// an existing account (C2), AND activated a dormant account (C3) is
+// running a broad privilege escalation campaign.
+
+union Hunt_C1, Hunt_C2, Hunt_C3
+| order by FinalScore desc, tostring(CreationTime) asc

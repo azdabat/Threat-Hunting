@@ -1,0 +1,196 @@
+//////////////////////////////////////////////////////////////////////////////////
+// SilverFox_ValleyRat_Sideload_BYOVD_Core (v2 — has_any bug fixed)
+// Author: Ala Dabat | Updated: 2026-07-05
+// Original Version: 2025-12 (Rev2)
+//
+// PURPOSE
+// Behavioural correlation hunt for SilverFox/ValleyRAT-style chains where a:
+//   Signed/legitimate loader → loads untrusted module (sideload) from writable path
+//   → stages driver-like artifact (often .sys OR disguised .dat/.bin/.tmp)
+//   → registers kernel service (registry/API/SC/PowerShell/WMI/PnP methods)
+//   → confirms actual kernel driver load (DriverLoadEvent ground truth)
+//
+// FIXES IN v2:
+//   [BUG] has_any() only matches WHOLE TOKENS (split on punctuation/whitespace).
+//         "New-Service", "sc.exe" (as a literal needle, not the FileName
+//         filter), "CreateService", "NtLoadDriver" mixed with clean words
+//         in one list is fine individually, but needles like
+//         "HKLM\SYSTEM\CurrentControlSet\Services" and setupapi-style
+//         entries elsewhere in this family of hunts contain path
+//         separators/hyphens that break has_any's single-token matching.
+//         Fixed every punctuated/multi-word needle to contains_any.
+//
+// [UNVERIFIED — CHECK BEFORE TRUSTING THIS HUNT]
+//   ActionType == "DriverLoadEvent" is this hunt's entire ground truth
+//   anchor. Verify first:
+//     DeviceEvents | where ActionType has "Driver" | distinct ActionType
+//
+// [NOTE] This is the OLDER Rev2 version, kept here only because it was
+// asked for directly. HUNT_SilverFox-ValleyRAT_BYOVD_v2.kql (the
+// "Framework-Aligned" version) is the more current design — recommend
+// standardising on that one going forward rather than maintaining both.
+//
+// TABLES
+// DeviceImageLoadEvents, DeviceFileEvents, DeviceRegistryEvents, DeviceProcessEvents, DeviceEvents
+//
+// MITRE
+// T1574.002 DLL Side-Loading | T1543.003 Windows Service | T1068 Priv Esc (BYOVD)
+// T1562.001 Disable/Modify Tools | T1027 Obfuscated/Disguised Artifacts
+//////////////////////////////////////////////////////////////////////////////////
+
+let Lookback = 24h;
+
+let SideloadToDropWindow = 6h;
+let DropToServiceWindow  = 2h;
+let ServiceToKernelWindow = 2h;
+
+let WritablePaths = dynamic(["\\Temp\\","\\ProgramData\\","\\Users\\","\\Public\\","\\Desktop\\","\\Downloads\\","\\AppData\\"]);
+
+let ModuleExtRegex = @"\.(dll|ocx|cpl|dat|bin|tmp)$";
+let DriverExtRegex = @"\.(sys|drv|dat|bin|tmp|ax)$";
+
+// 1) SIDELOAD (behavioural)
+let SideloadEvents =
+DeviceImageLoadEvents
+| where Timestamp > ago(Lookback)
+| where InitiatingProcessFolderPath has_any (WritablePaths)
+| where FolderPath == InitiatingProcessFolderPath
+| where InitiatingProcessSignatureStatus == "Signed"
+| where FileName matches regex ModuleExtRegex
+| where (SignatureStatus != "Signed" or Signer != InitiatingProcessSigner)
+| project
+    DeviceId,
+    SideloadTime = Timestamp,
+    LoaderName   = InitiatingProcessFileName,
+    LoaderPath   = InitiatingProcessFolderPath,
+    LoaderPid    = InitiatingProcessId,
+    LoaderSigner = tostring(InitiatingProcessSigner),
+    LoadedModule = FileName,
+    LoadedModulePath = FolderPath,
+    LoadedSigner = tostring(Signer),
+    LoadedSigStatus = tostring(SignatureStatus);
+
+// 2) DRIVER-LIKE DROP into writable path
+let DriverDrops =
+DeviceFileEvents
+| where Timestamp > ago(Lookback)
+| where ActionType in ("FileCreated","FileModified","FileRenamed","FileMoved")
+| where FolderPath has_any (WritablePaths)
+| where FileName matches regex DriverExtRegex
+| project
+    DeviceId,
+    DropTime = Timestamp,
+    DriverFile = FileName,
+    DriverFolder = FolderPath,
+    DropperPid = InitiatingProcessId,
+    DropperProc = InitiatingProcessFileName,
+    DropperCmd  = InitiatingProcessCommandLine;
+
+// 3a) Registry/API service creation
+let ServiceRegistry =
+DeviceRegistryEvents
+| where Timestamp > ago(Lookback)
+| where RegistryKey has @"System\CurrentControlSet\Services"
+| where RegistryValueName == "ImagePath"
+| where RegistryValueData has_any (WritablePaths)
+| where RegistryValueData matches regex @"\.(sys|drv|dat|bin|tmp|dll)$"
+| project
+    DeviceId,
+    ServiceTime = Timestamp,
+    ServiceIndicator = RegistryKey,
+    ServiceValue = RegistryValueData,
+    ServicePid = InitiatingProcessId,
+    Method = "Registry/API";
+
+// 3b) [FIXED] Process methods — punctuated needles moved to contains_any
+let ServiceProcess =
+DeviceProcessEvents
+| where Timestamp > ago(Lookback)
+| where FileName in~ ("sc.exe","pnputil.exe","powershell.exe","pwsh.exe","wmic.exe","rundll32.exe","reg.exe")
+| where isnotempty(ProcessCommandLine)
+| where (
+    (FileName =~ "sc.exe" and ProcessCommandLine has_any ("create","start") and ProcessCommandLine has_any (WritablePaths) and ProcessCommandLine matches regex @"\.(sys|dat|bin|tmp|drv)\b")
+    or
+    ((FileName in~ ("powershell.exe","pwsh.exe")) and ProcessCommandLine contains_any ("New-Service","sc.exe","CreateService","NtLoadDriver","Start-Service") and ProcessCommandLine has_any (WritablePaths))
+    or
+    (FileName =~ "wmic.exe" and ProcessCommandLine has_any ("service","create") and ProcessCommandLine has_any (WritablePaths))
+    or
+    (FileName =~ "pnputil.exe" and ProcessCommandLine contains_any ("/add-driver","/install") and ProcessCommandLine has_any (WritablePaths))
+    or
+    (FileName =~ "rundll32.exe" and ProcessCommandLine contains_any ("setupapi.dll","InstallHinfSection") and ProcessCommandLine has_any (WritablePaths))
+    or
+    (FileName =~ "reg.exe" and ProcessCommandLine contains_any ("add","HKLM\\SYSTEM\\CurrentControlSet\\Services") and ProcessCommandLine has_any (WritablePaths))
+  )
+| project
+    DeviceId,
+    ServiceTime = Timestamp,
+    ServiceIndicator = ProcessCommandLine,
+    ServiceValue = "",
+    ServicePid = ProcessId,
+    Method = "Process";
+
+let DriverServiceCreates = union ServiceRegistry, ServiceProcess;
+
+// 4) KERNEL LOAD (ground truth) — VERIFY ActionType FIRST, see header
+let KernelDriverLoads =
+DeviceEvents
+| where Timestamp > ago(Lookback)
+| where ActionType == "DriverLoadEvent"
+| where FolderPath has_any (WritablePaths)
+| project
+    DeviceId,
+    KernelLoadTime = Timestamp,
+    KernelDriverName = FileName,
+    KernelDriverPath = FolderPath;
+
+// 5) CORRELATION CHAIN
+SideloadEvents
+| join kind=inner (DriverDrops) on DeviceId
+| where DropTime between (SideloadTime .. SideloadTime + SideloadToDropWindow)
+| join kind=inner (DriverServiceCreates) on DeviceId
+| where ServiceTime between (DropTime .. DropTime + DropToServiceWindow)
+| join kind=inner (KernelDriverLoads) on DeviceId
+| where KernelLoadTime between (ServiceTime .. ServiceTime + ServiceToKernelWindow)
+
+// 6) AGGREGATION
+| summarize
+    FirstSeen        = min(SideloadTime),
+    LastSeen         = max(KernelLoadTime),
+    LoaderName       = any(LoaderName),
+    LoaderPath       = any(LoaderPath),
+    LoaderSigner     = any(LoaderSigner),
+    LoadedModules    = make_set(LoadedModule, 10),
+    LoadedSigStatus  = make_set(LoadedSigStatus, 5),
+    LoadedSigners    = make_set(LoadedSigner, 10),
+    DriverFiles      = make_set(DriverFile, 10),
+    DriverFolders    = make_set(DriverFolder, 10),
+    ServiceMethods   = make_set(Method, 5),
+    ServiceIndicators= make_set(ServiceIndicator, 10),
+    KernelDrivers    = make_set(KernelDriverName, 10),
+    KernelPaths      = make_set(KernelDriverPath, 10),
+    SampleDropperProcs = make_set(DropperProc, 10),
+    SampleDropperCmds  = make_set(DropperCmd, 5)
+  by DeviceId
+
+| extend RiskScore = 95
+| extend Severity = "CRITICAL"
+| extend HunterDirective = strcat(
+    "CRITICAL: Signed loader abuse consistent with SilverFox/ValleyRAT BYOVD chain. ",
+    "Loader=", LoaderName, " (", LoaderSigner, ") from ", LoaderPath, ". ",
+    "Loaded untrusted module(s)=", tostring(LoadedModules), " (sig=", tostring(LoadedSigStatus), "; signer=", tostring(LoadedSigners), "). ",
+    "Staged driver-like artifact(s)=", tostring(DriverFiles), " in ", tostring(DriverFolders), ". ",
+    "Service creation observed via ", tostring(ServiceMethods), ". ",
+    "KERNEL CONFIRMATION: DriverLoadEvent for ", tostring(KernelDrivers), " from ", tostring(KernelPaths), ". ",
+    "Action: isolate host immediately; acquire driver/module; hunt for security-tool tamper + persistence; expand scope by loader/module name across fleet."
+)
+| project
+    FirstSeen, LastSeen, Severity, RiskScore,
+    DeviceId,
+    LoaderName, LoaderPath, LoaderSigner,
+    LoadedModules, LoadedSigStatus, LoadedSigners,
+    DriverFiles, DriverFolders,
+    ServiceMethods, ServiceIndicators,
+    KernelDrivers, KernelPaths,
+    SampleDropperProcs, SampleDropperCmds,
+    HunterDirective
+| order by LastSeen desc

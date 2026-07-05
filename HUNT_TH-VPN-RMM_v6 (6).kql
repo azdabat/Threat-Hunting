@@ -1,0 +1,219 @@
+// ============================================================================
+// HUNT_TH-VPN-RMM — First-time VPN Login → RMM Execution Chain
+// ============================================================================
+// Author        : Ala Dabat (original V5 base)
+// Updated       : 2026-07-04 (V6)
+// Type          : PEAK Hypothesis-Driven Hunt (entity + rarity baseline)
+// MITRE         : T1133 · T1219 · T1078
+// Tactic        : TA0001 Initial Access · TA0011 C2 · TA0003 Persistence
+// Platform      : MDE Advanced Hunting / Sentinel / ADX Docker (Mordor lab)
+//
+// Hypothesis: A user has authenticated via VPN from a source (IP/location/ASN)
+//             they have never used before, and within 4 hours that user or a
+//             device they logged into executed an RMM tool for the first time.
+//             This is the Akira/BlackBasta affiliate kill chain:
+//             compromised credentials → VPN → RMM install → ransomware.
+//
+// FIXES FROM V5:
+//   [TIMESTAMP]  TimeGenerated replaced with Timestamp for ADX/MDE compatibility.
+//                Sentinel uses TimeGenerated — swap back for Sentinel deployment.
+//   [BUG-4]      any(Cmd) replaced with arg_max(Timestamp, *) for determinism.
+//   [BUG-1]      Baseline window correctly excludes Lookback period.
+//   [SCORE]      RiskScore base lowered from 80 to 60 — middle path not auto-alert.
+//                80 = engineering rule territory. 60 = hunt with analyst review.
+//   [SCHEMA]     ADX tables use Timestamp. SigninLogs may use TimeGenerated.
+//                column_ifexists() used for fields absent in Mordor lab schema.
+//
+// FIXES IN V6 (this version):
+//   [BUG-5]      RMMExec: DeviceProcessEvents.AccountName does not exist in the
+//                Mordor lab schema ("Failed to resolve scalar expression named
+//                'AccountName'"). Swapped to column_ifexists() fallback chain:
+//                InitiatingProcessAccountName (correct MDE field) -> AccountName
+//                (older/alt connector variant) -> "" (safe default, never crashes).
+//   [NOTE]       If InitiatingProcessAccountName is also absent/empty in this
+//                Mordor dataset, User will resolve to "" for all rows — this is
+//                a silent logic gap (zero results downstream), not a crash.
+//                Verify actual column names via DeviceProcessEvents | getschema
+//                before relying on hunt results.
+//
+// STRENGTH OF ORIGINAL RULE (PRESERVED):
+//   - leftanti join for baseline is architecturally correct
+//   - Multi-source VPN normalisation (IdentityLogonEvents + SigninLogs) is smart
+//   - 4h correlation window is realistic for this attack pattern
+//   - Per-user per-IP baseline is the right granularity
+// ============================================================================
+
+// ============================================================================
+// OPTIONAL PRE-FLIGHT CHECK — run this block by itself first (highlight +
+// Run) to confirm which account field actually carries data in THIS
+// environment before trusting the hunt output below. Costs one query.
+// ============================================================================
+// DeviceProcessEvents
+// | where Timestamp > ago(1d)
+// | take 20
+// | project AccountName, InitiatingProcessAccountName, DeviceName, ProcessCommandLine
+// ============================================================================
+
+let Lookback   = 24h;
+let History    = 14d;
+let RMMWindow  = 4h;
+
+let RMM_Tools = dynamic([
+    "anydesk.exe","teamviewer.exe","rustdesk.exe","screenconnect.client.exe",
+    "splashtop.exe","logmein.exe","ateraagent.exe","remoteutilities.exe",
+    "vncviewer.exe","realvnc.exe","tightvnc.exe","ultravnc.exe","supremo.exe",
+    "bomgar.exe","zohoassist.exe","gotoassist.exe","kaseyavsa.exe"
+]);
+
+// ── STAGE 1: RMM EXECUTION ───────────────────────────────────────────────────
+let RMMExec =
+    DeviceProcessEvents
+    | where Timestamp > ago(Lookback)
+    | where FileName in~ (RMM_Tools)
+        or (FileName =~ "msiexec.exe"
+            and ProcessCommandLine has_any ("anydesk","teamviewer","rustdesk",
+                                            "screenconnect","vnc","splashtop"))
+    // [BUG-5 FIX] AccountName does not exist on DeviceProcessEvents in the
+    // Mordor lab schema. Fall back through InitiatingProcessAccountName
+    // (correct MDE Advanced Hunting field) -> AccountName -> "".
+    | extend User = tolower(column_ifexists("InitiatingProcessAccountName",
+                             column_ifexists("AccountName", "")))
+    | extend RMMCmd_ = column_ifexists("ProcessCommandLine", "")
+    | extend DeviceName_ = column_ifexists("DeviceName", "")
+    | summarize
+        RMM_FirstTime = min(Timestamp),
+        RMM_LastTime  = max(Timestamp),
+        RMMTools      = make_set(FileName, 5),
+        arg_max(Timestamp, RMMCmd_, DeviceName_) // BUG-4 FIX, schema-safe fields
+      by User
+    | project-rename RMMCmd = RMMCmd_, DeviceName = DeviceName_;
+
+// ── STAGE 2: VPN LOGIN NORMALISATION ─────────────────────────────────────────
+// Multi-source: IdentityLogonEvents covers on-prem RADIUS/NPS VPN
+//               SigninLogs covers Azure AD / Entra conditional access VPN
+// ADX NOTE: These tables may have Timestamp OR TimeGenerated depending on source.
+//           column_ifexists() handles both lab and production schemas.
+// ─────────────────────────────────────────────────────────────────────────────
+let VPN_Identity =
+    IdentityLogonEvents
+    | where Timestamp > ago(History)
+    | where LogonType in ("RemoteInteractive","RemoteAccess","Network")
+    | project
+        EventTime = Timestamp,
+        User      = tolower(column_ifexists("AccountName",
+                             column_ifexists("TargetAccountName",
+                             column_ifexists("UserName", "")))),
+        IP        = IPAddress,
+        Location  = column_ifexists("Location", "Unknown");
+
+let VPN_SignIn =
+    SigninLogs
+    | where column_ifexists("TimeGenerated", datetime(null)) > ago(History)
+    | where column_ifexists("AppDisplayName", "") has "VPN"
+        or column_ifexists("ResourceDisplayName", "") has "VPN"
+        or column_ifexists("ClientAppUsed", "") has "VPN"
+        or column_ifexists("NetworkLocationDetails", "") has "VPN"
+    | where column_ifexists("ResultType", 0) == 0
+    | extend Country = tostring(column_ifexists("LocationDetails", dynamic(null))["countryOrRegion"])
+    | project
+        EventTime = column_ifexists("TimeGenerated", datetime(null)),
+        User      = tolower(column_ifexists("UserPrincipalName",
+                             column_ifexists("AccountName", ""))),
+        IP        = column_ifexists("IPAddress", ""),
+        Location  = Country;
+
+let VPN_All = union VPN_Identity, VPN_SignIn;
+
+// ── STAGE 3: BASELINE + NEW LOGIN DETECTION ───────────────────────────────────
+// [BUG-1 FIX] Historical baseline strictly before the detection window
+let Historical =
+    VPN_All
+    | where EventTime between (ago(History) .. ago(Lookback))
+    | distinct User, IP, Location;
+
+// Recent logins in detection window
+let Recent =
+    VPN_All
+    | where EventTime > ago(Lookback);
+
+// leftanti = rows in Recent NOT matching any row in Historical
+// = logins from new IP/location this user has never used before
+let SuspiciousVPN =
+    Recent
+    | join kind=leftanti Historical on User, IP
+    | extend AnomalyReason = "NewIP_NeverSeenBefore"
+    | project
+        VPN_Time = EventTime,
+        User, IP, Location, AnomalyReason;
+
+// ── STAGE 4: CORRELATION VPN → RMM ───────────────────────────────────────────
+SuspiciousVPN
+| join kind=inner RMMExec on User
+| where (RMM_FirstTime - VPN_Time) between (0min .. RMMWindow)
+| extend
+    GapMinutes = datetime_diff("minute", RMM_FirstTime, VPN_Time)
+// Scoring — middle path base (not 80 which is engineering territory)
+| extend
+    RiskScore =
+        60
+        + iif(RMMTools has_any ("anydesk.exe","rustdesk.exe"), 15, 0)
+        + iif(RMMCmd has_any ("install","setup","/quiet","/silent","msiexec"), 15, 0)
+        + iif(Location !in ("United Kingdom","US","United States",""), 10, 0)
+        + iif(GapMinutes <= 30, 10, 0)   // very fast pivot = more suspicious
+| extend HuntAlert = case(
+    RiskScore >= 90,
+        strcat("CRITICAL -- User '", User,
+               "' authenticated via NEW VPN IP ", IP, " [", Location, "] ",
+               "then installed/executed ", tostring(RMMTools),
+               " on '", DeviceName, "' within ", tostring(GapMinutes), " minutes. ",
+               "AkiraRansom/BlackBasta pattern. ",
+               "ACTION: 1. Verify user identity via out-of-band channel. ",
+               "2. Check IdentityLogonEvents for lateral movement after VPN. ",
+               "3. Check DeviceNetworkEvents for RMM outbound connections. ",
+               "4. Preserve forensic state before disabling account."),
+    RiskScore >= 75,
+        strcat("HIGH -- User '", User,
+               "' new VPN IP ", IP, " → RMM ", tostring(RMMTools),
+               " within ", tostring(GapMinutes), " minutes. ",
+               "ACTION: Validate with user. Check if planned remote access. ",
+               "Review recent email for phishing context."),
+    strcat("MEDIUM -- New VPN IP followed by RMM. ",
+           "User: ", User, ". IP: ", IP, ". Gap: ", tostring(GapMinutes), "min. ",
+           "ACTION: Confirm legitimate remote work scenario.")
+)
+| project
+    VPN_Time,
+    RMM_FirstTime,
+    GapMinutes,
+    User,
+    IP,
+    Location,
+    AnomalyReason,
+    RMMTools = tostring(RMMTools),
+    RMMCmd,
+    DeviceName,
+    RiskScore,
+    HuntAlert
+| order by RiskScore desc, GapMinutes asc
+
+// ============================================================================
+// ADX LAB NOTES:
+//   - Before running, verify actual field names on this table:
+//       DeviceProcessEvents | getschema
+//     If InitiatingProcessAccountName is also missing/empty in Mordor data,
+//     RMMExec.User will be "" for every row and Stage 4's join will return 0
+//     rows (silent, not an error) — check RMMExec on its own first:
+//       DeviceProcessEvents | take 5 | project AccountName, InitiatingProcessAccountName
+//   - IdentityLogonEvents in Mordor may be sparse or use different field names
+//   - SigninLogs VPN filter may return 0 rows if no VPN AppDisplayName present
+//   - To test in ADX: replace VPN_All with datatable() containing synthetic
+//     historical logins and a new-IP login in the detection window
+//
+// SENTINEL DEPLOYMENT:
+//   - Replace Timestamp with TimeGenerated throughout
+//   - Remove column_ifexists() wrappers — all fields present in production
+//   - SigninLogs uses TimeGenerated natively — remove column_ifexists() on EventTime
+//   - Confirm InitiatingProcessAccountName is the production field (it is,
+//     for standard MDE Advanced Hunting schema) and drop the AccountName
+//     fallback if you want a stricter/faster query.
+// ============================================================================

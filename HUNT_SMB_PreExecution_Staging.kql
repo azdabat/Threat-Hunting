@@ -1,0 +1,225 @@
+// ============================================================================
+// THREAT HUNT A: SMB_LateralMovement_PreExecution_Staging
+// Author: Ala Dabat | Date: 2026-07-05
+// MITRE: T1021.002 (SMB Admin Shares), T1543.003 (Service Install)
+// Kill Chain Position: EARLIER than SMB_Service_Execution composite
+//
+// RELATIONSHIP TO COMPOSITE:
+//   The SMB_Service_Execution composite anchors on services.exe spawning
+//   an uncommon child — the execution moment. This hunt looks one step
+//   earlier: the attacker has written a payload to an admin share and/or
+//   registered a service, but the execution hasn't happened yet.
+//
+//   Composite fires:  services.exe → uncommon child (execution confirmed)
+//   This hunt fires:  payload written to ADMIN$/C$ OR service registered
+//                     pointing to a writable path (staging, pre-execution)
+//
+// WHY THIS IS A HUNT, NOT A COMPOSITE:
+//   Admin share writes and service registration happen constantly from
+//   legitimate IT operations (SCCM, Intune, patch management, helpdesk).
+//   Without an execution anchor, the false positive rate is too high for
+//   24/7 composite alerting. This is a periodic hunt — run when the
+//   composite fires to catch staging that predates it, or run weekly to
+//   find staging that hasn't executed yet.
+//
+// MINIMUM TRUTH:
+//   A file with an executable extension was written to an admin share
+//   (ADMIN$, C$) OR a service was registered with an ImagePath pointing
+//   to a user-writable location — AND this was preceded by an inbound
+//   SMB/RPC connection from an external source within the correlation window.
+//   Neither signal alone is truth. The combination is.
+//
+// WHAT THIS CATCHES THAT THE COMPOSITE MISSES:
+//   1. Fileless staging that never drops a file (sc.exe service registration
+//      without a prior file drop — attacker uses an existing binary)
+//   2. Staging that occurred hours/days before execution (temporal gap)
+//   3. Failed execution attempts (payload staged, service created,
+//      but services.exe never spawned the child — tool error or AV block)
+//   4. Attacker reconnaissance via admin share access without execution
+// ============================================================================
+
+let Lookback      = 7d;   // Longer than composite (3d) — staging can happen days before execution
+let CorrWindow    = 30m;  // Wider than composite — staging is less time-precise than execution
+
+// ── CONFIGURATION ────────────────────────────────────────────────────────────
+
+let AdminShareMarkers = dynamic([
+    "\\ADMIN$\\", "\\C$\\", "\\IPC$\\",
+    "\\admin$\\", "\\c$\\",  "\\ipc$\\"
+]);
+
+let ExecutableExtensions = dynamic([
+    ".exe", ".dll", ".sys", ".bat",
+    ".ps1", ".vbs", ".js", ".hta"
+]);
+
+let WritablePaths = dynamic([
+    "\\Temp\\", "\\Windows\\Temp\\", "\\Users\\Public\\",
+    "\\ProgramData\\", "\\AppData\\"
+]);
+
+let KnownManagementTools = dynamic([
+    "ccmexec.exe", "sccmagent.exe", "intunemanagementextension.exe",
+    "taniumclient.exe", "qualysagent.exe"
+]);
+
+// ── PHASE 1: MINIMUM TRUTH ───────────────────────────────────────────────────
+//
+// Two independent staging signals — either one qualifies as truth
+// when combined with the SMB precursor (Phase 3).
+//
+// SIGNAL 1A: Executable written to admin share
+// WHY: Attackers must stage their payload on the target host before
+// a service can execute it. Writing to ADMIN$/C$ requires admin access
+// and is a direct staging artifact.
+
+let AdminShareWrites =
+    DeviceFileEvents
+    | where Timestamp >= ago(Lookback)
+    | where ActionType in ("FileCreated", "FileModified")
+    | where FolderPath has_any (AdminShareMarkers)
+    | where FileName has_any (ExecutableExtensions)
+    | where not(tolower(InitiatingProcessFileName) in~ (KnownManagementTools))
+    | project
+        DeviceId,
+        DeviceName,
+        StagingTime  = Timestamp,
+        StagingType  = "AdminShareWrite",
+        StagingFile  = FileName,
+        StagingPath  = FolderPath,
+        // Native enrichment — no join needed for process context
+        WriterProc   = InitiatingProcessFileName,
+        WriterCmd    = InitiatingProcessCommandLine,
+        WriterSigner = InitiatingProcessSigner,
+        WriterAcct   = InitiatingProcessAccountName;
+
+// SIGNAL 1B: Service registered pointing to writable path
+// WHY: Before services.exe executes a service, the service must be
+// registered in the registry with an ImagePath. If that ImagePath
+// points to a user-writable location (Temp, ProgramData, AppData),
+// the service was almost certainly installed by an attacker, not a
+// legitimate installer.
+
+let ServiceRegistration =
+    DeviceRegistryEvents
+    | where Timestamp >= ago(Lookback)
+    | where ActionType == "RegistryValueSet"
+    | where RegistryKey has "\\System\\CurrentControlSet\\Services\\"
+    | where RegistryValueName =~ "ImagePath"
+    | where RegistryValueData has_any (WritablePaths)
+    | where not(tolower(InitiatingProcessFileName) in~ (KnownManagementTools))
+    | project
+        DeviceId,
+        DeviceName,
+        StagingTime  = Timestamp,
+        StagingType  = "ServiceRegistration",
+        StagingFile  = RegistryValueData,
+        StagingPath  = RegistryKey,
+        WriterProc   = InitiatingProcessFileName,
+        WriterCmd    = InitiatingProcessCommandLine,
+        WriterSigner = InitiatingProcessSigner,
+        WriterAcct   = InitiatingProcessAccountName;
+
+// Combine both staging signals into one surface
+let StagingEvents = union AdminShareWrites, ServiceRegistration;
+
+// ── PHASE 2: NATIVE ENRICHMENT ───────────────────────────────────────────────
+// Already extracted via InitiatingProcess* fields above.
+// No DeviceProcessEvents join needed — zero memory pressure.
+
+// ── PHASE 3: SAFE PRE-SUMMARISED JOIN — SMB Precursor ────────────────────────
+//
+// WHY THIS IS REINFORCEMENT, NOT MINIMUM TRUTH:
+// Admin share writes can occur from legitimate management tools.
+// An SMB/RPC connection preceding the staging event narrows this to
+// attacker-controlled lateral movement. The staging alone is suspicious.
+// The staging + SMB precursor is high-confidence.
+//
+// Pre-summarise first (small table) — never join two raw tables.
+
+let InboundSMBRPC =
+    DeviceNetworkEvents
+    | where Timestamp >= ago(Lookback)
+    | where ActionType == "InboundConnectionAccepted"
+    | where LocalPort in (445, 135)
+    | where isnotempty(RemoteIP)
+    | summarize
+        SMBCount   = count(),
+        SourceIPs  = make_set(RemoteIP, 10),
+        FirstSMB   = min(Timestamp),
+        LastSMB    = max(Timestamp)
+      by DeviceId;
+
+// ── PHASE 4: CONVERGENCE SCORING ─────────────────────────────────────────────
+
+StagingEvents
+| join kind=leftouter (InboundSMBRPC) on DeviceId
+| extend SMBPreceded = isnotempty(SourceIPs)
+      and FirstSMB between ((StagingTime - CorrWindow) .. StagingTime)
+| extend
+    // Base score: staging type
+    BaseScore   = case(
+        StagingType == "AdminShareWrite"   , 50,
+        StagingType == "ServiceRegistration", 55,
+        40
+    ),
+    // Reinforcement: SMB precursor confirms remote origin
+    R1_SMB      = iif(SMBPreceded, 25, 0),
+    // Reinforcement: unsigned writer (not a legitimate installer)
+    R2_Unsigned = iif(WriterSigner == "" or WriterSigner == "Unknown", 10, 0),
+    // Reinforcement: suspicious writer process
+    R3_SuspProc = iif(tolower(WriterProc) in~ (
+        dynamic(["powershell.exe","cmd.exe","wscript.exe","mshta.exe","rundll32.exe"])
+    ), 15, 0)
+| extend FinalScore = BaseScore + R1_SMB + R2_Unsigned + R3_SuspProc
+| extend Severity = case(
+    FinalScore >= 85, "CRITICAL",
+    FinalScore >= 65, "HIGH",
+    FinalScore >= 50, "MEDIUM",
+    "LOW"
+  )
+| where Severity != "LOW"
+
+// ── PHASE 5: HUNTER DIRECTIVE ─────────────────────────────────────────────────
+
+| extend HunterDirective = pack_array(
+    strcat("[MIN_TRUTH] StagingType=", StagingType,
+           " | File/Path=", StagingFile,
+           " | Writer=", WriterProc,
+           " | Account=", WriterAcct),
+    strcat("[SCORE] Final=", tostring(FinalScore), " | Severity=", Severity,
+           " | Base=", tostring(BaseScore),
+           " | SMBPrecursor=", tostring(R1_SMB),
+           " | UnsignedWriter=", tostring(R2_Unsigned),
+           " | SuspiciousProc=", tostring(R3_SuspProc)),
+    strcat("[SMB] SMBPreceded=", tostring(SMBPreceded),
+           " | SourceIPs=", tostring(SourceIPs),
+           " | SMBWindow=", tostring(FirstSMB), " → ", tostring(StagingTime)),
+    // Kill chain position statement
+    "[KILL_CHAIN] PRE-EXECUTION: Payload staged but services.exe has not yet spawned a child. Attacker may be in the staging phase. Execution is imminent or may have failed.",
+    // Immediate analyst actions
+    "[ACTION_1] Check if services.exe has already spawned an uncommon child on this host. If yes, the composite should have already fired — correlate both findings.",
+    "[ACTION_2] Query DeviceRegistryEvents for service registrations on this host near StagingTime. Look for ImagePath pointing to the staged file.",
+    "[ACTION_3] Query SecurityEvent EventID 7045 (Service Installed) on this host for the same window.",
+    "[ACTION_4] Pivot on SourceIPs: what else has this IP connected to? Is it an internal host or external? If internal, it may already be compromised.",
+    "[ACTION_5] If no execution has occurred yet: opportunity to block before the composite fires. Isolate if confidence is HIGH/CRITICAL.",
+    "[PIVOT] DeviceFileEvents | where DeviceName == <host> and FolderPath has_any (AdminShareMarkers) | ±60m",
+    "[PIVOT] DeviceRegistryEvents | where DeviceName == <host> and RegistryKey has 'Services' | ±60m",
+    "[PIVOT] DeviceProcessEvents | where DeviceName == <host> and InitiatingProcessFileName =~ 'services.exe' | ±2h"
+)
+| project
+    StagingTime,
+    Severity,
+    FinalScore,
+    DeviceName,
+    StagingType,
+    StagingFile,
+    StagingPath,
+    WriterProc,
+    WriterCmd,
+    WriterSigner,
+    WriterAcct,
+    SMBPreceded,
+    SourceIPs,
+    HunterDirective
+| order by FinalScore desc, StagingTime desc

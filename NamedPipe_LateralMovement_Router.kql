@@ -1,0 +1,324 @@
+// ============================================================================
+// ROUTER RULE: NamedPipe_LateralMovement_Router
+// Author: Ala Dabat | Date: 2026-07-05
+// Framework: MTDF Router Rule Architecture (Architecture 2)
+// Platform: Microsoft Defender XDR / Sentinel Advanced Hunting
+// Base score: 0 — signals build from zero (router, not composite)
+// Threshold: >= 30 — triage signal, not production alert
+//
+// ============================================================================
+// WHY THIS IS A ROUTER RULE, NOT A COMPOSITE
+// ============================================================================
+//
+// MTDF rule: A composite requires a Minimum Truth anchor — one indisputable
+// fact that cannot exist in a normal enterprise without indicating attack.
+//
+// The pipe names in this file (psexesvc, remcom, lsarpc, spoolss, etc.)
+// CANNOT serve as Minimum Truth anchors because:
+//
+// MEDIUM RISK PIPES (psexesvc, paexec, remcom, wmiexec, etc.):
+//   These are tool names, not structural patterns. The problem:
+//   - psexesvc exists on any host where a sysadmin used PsExec legitimately
+//   - remcom is used by legitimate remote management tooling
+//   - wmiexec appears in some benign automation scripts
+//   In a 1000-device enterprise, these pipe names generate hundreds of
+//   events per day from legitimate operations. A composite anchored on
+//   "psexesvc pipe exists" would produce catastrophic false positive rates.
+//   These names are NOT minimum truth. They are INDICATORS that require
+//   correlation to become evidence.
+//
+// LEGACY RPC PIPES (lsarpc, spoolss, samr, netlogon, etc.):
+//   These are Windows system pipes used constantly by the OS itself for
+//   legitimate operations:
+//   - lsarpc: Used by LSA for authentication (fires constantly in AD)
+//   - spoolss: Print spooler — fires on any host with a printer
+//   - netlogon: Domain authentication — fires on every login event
+//   - samr: SAM database access — fires on many admin operations
+//   Using any of these as a truth anchor would result in near-100% FP rate.
+//   They only become suspicious when an ATTACKER uses them in specific
+//   patterns: accessing samr from a non-DC process, accessing lsarpc from
+//   a scripting host, connecting netlogon over SMB from a workstation.
+//   The context is the truth. The pipe name is just a hint.
+//
+// WHAT A ROUTER RULE DOES INSTEAD:
+//   Rather than asserting "this is a threat" (composite behavior), this
+//   rule asks: "Is attack intent present somewhere in this pipe activity?"
+//   When enough signals converge (pipe name + SMB + service + parent),
+//   the analyst is routed to the appropriate composite for confirmation.
+//
+//   If the named composite exists: run it.
+//   If it doesn't exist yet: the RoutingDirective tells the analyst to
+//   investigate manually and flags the gap in composite coverage.
+//
+// ============================================================================
+// DECOMPOSITION STATUS
+// ============================================================================
+//
+// As composites are built for each technique, retire them from this router.
+// A router rule that is never retired is coverage debt, not architecture.
+//
+// ┌──────────────────────────────┬────────────────────────────────┬──────────┐
+// │ Technique                    │ Composite Status               │ Action   │
+// ├──────────────────────────────┼────────────────────────────────┼──────────┤
+// │ PsExec via SMB pipe          │ SMB_Service_Lateral (partial)  │ Keep     │
+// │ PAExec / RemCom variants     │ Not built                      │ Keep     │
+// │ WMIExec / SmbExec            │ WMI_RemoteExec (partial)       │ Keep     │
+// │ lsarpc / samr abuse          │ LSASS_Access composite (MDE)   │ Keep     │
+// │ spoolss printer spooler      │ PrintNightmare composite TBD   │ Keep     │
+// │ netlogon anomaly             │ Not built                      │ Keep     │
+// │ Service control pipe abuse   │ SMB_Service_Lateral (partial)  │ Keep     │
+// └──────────────────────────────┴────────────────────────────────┴──────────┘
+//
+// ============================================================================
+// NOISE PROFILE: WHY THESE CANNOT SHARE A COMPOSITE
+// ============================================================================
+//
+// Each medium-risk pipe family has a completely different noise profile:
+//
+// psexesvc / paexec:
+//   Noise source: IT helpdesk, software deployment, patch management
+//   Suppression needed: managed endpoint lineage, SCCM/Intune parent
+//
+// remcom / remcom_*:
+//   Noise source: third-party remote management tooling
+//   Suppression needed: vendor allow-list, known management server IPs
+//
+// wmiexec / dcomexec / smbexec:
+//   Noise source: developer automation, WMI-based monitoring tools
+//   Suppression needed: developer machine baseline, monitoring server allow-list
+//
+// lsarpc / samr:
+//   Noise source: AD authentication, domain operations, security scanning
+//   Suppression needed: DC-to-DC comms, service account baseline, scan windows
+//
+// MTDF Rule 2: SPLIT when noise domain changes.
+// All four of these have different noise domains. A single composite
+// cannot be tuned for one without creating blind spots for the others.
+// Therefore they live in a router, not a composite.
+//
+// ============================================================================
+
+let lookback = 7d;
+let slowServiceLookback = 21d;
+let nearSmbWindowMins = 10;
+let nearServiceWindowMins = 20;
+let slowServiceWindowDays = 7;
+
+// ── CONFIGURATION ────────────────────────────────────────────────────────────
+
+let BaselineAccounts = dynamic([
+    "NT AUTHORITY\\SYSTEM", "LOCAL SERVICE", "NETWORK SERVICE"
+]);
+
+let BaselinePipeFragments = dynamic([
+    "eventlog","winsock","sql","postgres","mysql","oracle",
+    "vmware","vbox","hyperv","docker",
+    "chrome","msedge","brave","firefox","teams","onedrive"
+]);
+
+let SuspiciousParents = dynamic([
+    "winword.exe","excel.exe","powerpnt.exe","outlook.exe",
+    "wscript.exe","cscript.exe","mshta.exe","powershell.exe","pwsh.exe","cmd.exe",
+    "rundll32.exe","regsvr32.exe","wmic.exe"
+]);
+
+// MEDIUM RISK: Tool-specific pipe names with significant benign overlap
+// These fire on legitimate admin tooling but indicate attacker tooling
+// when correlated with SMB, service creation, or suspicious process context.
+let MediumRiskPipes = dynamic([
+    // PsExec family
+    "psexesvc","psexesvc-","paexec",
+    // RemCom family
+    "remcom","remcom_","remcom_svc","remcom_stdin","remcom_stdout","remcom_stderr",
+    // Impacket-style remote execution
+    "csexec","wmiexec","dcomexec","smbexec","atexec","scshell",
+    // Service control
+    "svcctl","servicecontrol"
+]);
+
+// LEGACY RPC: Windows OS pipes abused for lateral movement and credential access
+// These fire constantly from legitimate AD operations.
+// ONLY escalated with: non-system account + SMB/service/parent correlation + rarity
+let LegacyRpcPipes = dynamic([
+    "atsvc","spoolss","winreg","lsarpc","netlogon",
+    "samr","wkssvc","ntsvcs","w32time_alt","termsrv_api","epmapper"
+]);
+
+// ── PHASE 1: BROAD SURFACE FILTER ────────────────────────────────────────────
+// Cast wide net over medium-risk and legacy RPC pipes only.
+// High-confidence pipes (ForkNRunHex/Mojo/Epm/HighRisk) are deliberately
+// excluded here — they belong in the MTDF composite.
+
+let PipeEventsRaw =
+    DeviceEvents
+    | where TimeGenerated >= ago(lookback)
+    | where ActionType in ("NamedPipeEvent","NamedPipeCreated","NamedPipeConnected")
+    | extend F = parse_json(AdditionalFields)
+    | extend PipeName  = coalesce(tostring(F.PipeName), tostring(F.NamedPipe), tostring(F.Pipe))
+    | extend FileOp    = tostring(F.FileOperation)
+    | extend PipeLower = tolower(PipeName)
+    | where isnotempty(PipeName) or ActionType =~ "NamedPipeConnected"
+    | where PipeLower !has_any (BaselinePipeFragments)
+    // Only medium-risk and legacy RPC — high-confidence goes to composite
+    | where PipeLower has_any (MediumRiskPipes) or PipeLower has_any (LegacyRpcPipes)
+    | extend EventKind = case(
+        ActionType =~ "NamedPipeConnected", "Connected",
+        FileOp =~ "File connected",         "Connected",
+        FileOp =~ "File created",           "Created",
+        "Unknown"
+    )
+    | extend
+        Proc       = tostring(InitiatingProcessFileName),
+        Parent     = tostring(InitiatingProcessParentFileName),
+        AcctName   = tostring(AccountName),
+        SuspParent = tolower(tostring(InitiatingProcessParentFileName)) has_any (SuspiciousParents),
+        PipeCategory = case(
+            PipeLower has_any (MediumRiskPipes), "MediumRisk",
+            PipeLower has_any (LegacyRpcPipes),  "LegacyRPC",
+            "Unknown"
+        )
+    | project
+        TimeGenerated, DeviceId,
+        DeviceName  = tolower(DeviceName),
+        AcctName, Proc, Parent,
+        Cmd         = tostring(InitiatingProcessCommandLine),
+        PipeName, PipeLower, EventKind, PipeCategory,
+        SuspParent;
+
+// ── PHASE 2: PREVALENCE (rarity amplifies confidence) ────────────────────────
+
+let PipeFrequency =
+    PipeEventsRaw
+    | summarize OrgPipeCount = count(), HostCount = dcount(DeviceName) by PipeName;
+
+// ── PHASE 3: CORRELATION SIGNALS ─────────────────────────────────────────────
+
+let SmbPipeConnections =
+    DeviceNetworkEvents
+    | where TimeGenerated >= ago(lookback)
+    | where ActionType in ("ConnectionSuccess","NetworkConnectionSuccess","ConnectionSucceeded")
+    | where RemotePort in (445,139)
+    | extend F = parse_json(AdditionalFields)
+    | extend SmbPipeName = tostring(F.NamedPipe)
+    | where isnotempty(SmbPipeName)
+    | project
+        SmbTime    = TimeGenerated,
+        DeviceName = tolower(DeviceName),
+        RemoteIP, RemotePort,
+        SmbPipeName,
+        SmbPipeLower = tolower(SmbPipeName);
+
+let ServiceCreation =
+    SecurityEvent
+    | where TimeGenerated >= ago(slowServiceLookback)
+    | where EventID == 7045
+    | extend DeviceName = tolower(tostring(split(Computer, ".")[0]))
+    | project
+        SvcTime     = TimeGenerated,
+        DeviceName,
+        ServiceName = tostring(ServiceName),
+        ServiceFile = tostring(ServiceFileName),
+        ServiceAcct = tostring(Account);
+
+// ── PHASE 4: ROUTING SCORE ────────────────────────────────────────────────────
+//
+// BASE STARTS AT ZERO — non-negotiable for router rules.
+// No minimum truth has been established. Signals must build the case
+// from nothing. The analyst acts when enough signals converge.
+// This is triage, not a production alert.
+//
+// Scoring:
+//   Medium-risk pipe name match: +30 (tool-specific, meaningful start)
+//   Legacy RPC pipe match:       +15 (noisy, needs strong support)
+//   Rarity (<=3 hosts):          +20 (uncommon = more suspicious)
+//   Rarity (<=10 hosts):         +10
+//   Suspicious parent process:   +20 (Office / scripting host context)
+//   SMB + pipe name match:       +25 (strongest correlation signal)
+//   Near service creation:       +15 (PsExec/lateral movement pattern)
+//   Slow service (7d):           +8  (temporal deception awareness)
+//   Non-system account:          +10 (lateral movement is user-driven)
+
+PipeEventsRaw
+| join kind=leftouter PipeFrequency on PipeName
+| extend OrgPipeCount = coalesce(OrgPipeCount, 0), HostCount = coalesce(HostCount, 0)
+| join kind=leftouter (SmbPipeConnections) on DeviceName
+| extend SmbNear = isnotempty(RemoteIP)
+      and abs(datetime_diff("minute", TimeGenerated, SmbTime)) <= nearSmbWindowMins
+| extend PipeMatchesSmb = isnotempty(SmbPipeName)
+      and tolower(PipeName) == SmbPipeLower
+| join kind=leftouter (ServiceCreation) on DeviceName
+| extend ServiceNear = isnotempty(ServiceName)
+      and abs(datetime_diff("minute", TimeGenerated, SvcTime)) <= nearServiceWindowMins
+| extend ServiceSlow = isnotempty(ServiceName)
+      and abs(datetime_diff("day", TimeGenerated, SvcTime)) <= slowServiceWindowDays
+// Router scoring — base 0, no minimum truth established
+| extend RawScore = 0
+    + iff(PipeCategory == "MediumRisk", 30, 0)
+    + iff(PipeCategory == "LegacyRPC",  15, 0)
+    + iff(OrgPipeCount <= 3, 20, iff(OrgPipeCount <= 10, 10, 0))
+    + iff(SuspParent, 20, 0)
+    + iff(SmbNear and PipeMatchesSmb, 25, 0)
+    + iff(ServiceNear, 15, 0)
+    + iff(ServiceSlow, 8, 0)
+    + iff(AcctName !in (dynamic(["NT AUTHORITY\\SYSTEM","LOCAL SERVICE","NETWORK SERVICE"])), 10, 0)
+    - iff(HostCount >= 10, 15, iff(HostCount >= 5, 8, 0))
+| extend RiskScore = iif(RawScore < 0, 0, RawScore)
+// Low threshold — this is triage, not a production alert
+| where RiskScore >= 30
+// Enforce the LegacyRPC minimum context requirements
+// Legacy RPC is so noisy that without these guards it floods the queue
+| where not(
+    PipeCategory == "LegacyRPC"
+    and not(SuspParent)
+    and not(SmbNear and PipeMatchesSmb)
+    and not(ServiceNear)
+)
+// ── ROUTING DIRECTIVE ─────────────────────────────────────────────────────────
+//
+// NOT a HunterDirective — a RoutingDirective.
+// This tells the analyst WHICH composite to run to confirm truth.
+// If the composite doesn't exist yet, flags it as a gap.
+| extend RoutingDirective = case(
+    // Medium-risk pipe families
+    PipeName has_any ("psexesvc","paexec"),
+        "→ PIVOT TO: SMB_Service_Lateral MTDF Composite | Confirms remote execution via service creation over SMB",
+    PipeName has_any ("remcom","remcom_"),
+        "→ PIVOT TO: SMB_Service_Lateral MTDF Composite | RemCom-style lateral movement pattern",
+    PipeName has_any ("wmiexec","dcomexec"),
+        "→ PIVOT TO: WMI_RemoteExec MTDF Composite | WMI-based remote execution",
+    PipeName has_any ("smbexec","scshell","csexec"),
+        "→ INVESTIGATE: No dedicated composite yet — engineer SMBExec_Shell composite | Technique: SMB service exec without PsExec binary",
+    PipeName has_any ("svcctl","servicecontrol"),
+        "→ PIVOT TO: SMB_Service_Lateral MTDF Composite | Service control pipe abuse pattern",
+    // Legacy RPC abuse families
+    PipeName has "lsarpc" or PipeName has "samr",
+        "→ PIVOT TO: LSASS_Access MTDF Composite | LSA/SAM pipe access = credential access pattern",
+    PipeName has "spoolss",
+        "→ INVESTIGATE: PrintNightmare / PrintSpoofer composite not yet built | Technique: spooler pipe privilege escalation",
+    PipeName has "netlogon",
+        "→ INVESTIGATE: No dedicated composite yet — engineer Netlogon_Abuse composite | Check for ZeroLogon (CVE-2020-1472) patterns",
+    PipeName has "winreg",
+        "→ PIVOT TO: Registry_Persistence composites | Remote registry access via winreg pipe",
+    PipeName has "atsvc",
+        "→ PIVOT TO: ScheduledTask composites | AT scheduler remote task creation",
+    "→ INVESTIGATE: Unknown pipe pattern — review manually and consider engineering new composite"
+)
+| extend ThreatCategory = case(
+    PipeCategory == "MediumRisk" and SmbNear, "LateralMovement/RemoteExec",
+    PipeCategory == "MediumRisk" and ServiceNear, "LateralMovement/ServiceInstall",
+    PipeCategory == "LegacyRPC" and SuspParent, "CredentialAccess/RPCAbuse",
+    PipeCategory == "LegacyRPC" and SmbNear, "LateralMovement/RPCLateral",
+    "SuspiciousPipeActivity"
+)
+| summarize arg_max(TimeGenerated, *) by DeviceName, PipeName
+| project
+    TimeGenerated, DeviceName, AcctName,
+    PipeName, EventKind, PipeCategory, ThreatCategory,
+    Proc, Parent, Cmd,
+    SuspParent, SmbNear, RemoteIP, RemotePort,
+    SmbPipeName, PipeMatchesSmb,
+    ServiceNear, ServiceSlow, ServiceName, ServiceFile,
+    OrgPipeCount, HostCount,
+    RiskScore,
+    RoutingDirective
+| order by RiskScore desc, TimeGenerated desc

@@ -1,0 +1,391 @@
+// ============================================================================
+// THREAT HUNT: NamedPipe_C2_LateralMovement_Hunt_Campaign
+// Author: Ala Dabat | Date: 2026-07-05
+// Framework: PEAK + MTDF (Hypothesis-driven, periodic investigation)
+// Platform: Microsoft Defender XDR / Sentinel Advanced Hunting
+// Frequency: PERIODIC — run on-demand or weekly/fortnightly campaign
+//            NOT for continuous 24/7 monitoring
+//
+// ============================================================================
+// WHY THIS IS A THREAT HUNT, NOT A COMPOSITE OR ROUTER
+// ============================================================================
+//
+// A THREAT HUNT answers the question: "Is this threat active in our
+// environment RIGHT NOW?" It is exploratory and hypothesis-driven.
+//
+// A COMPOSITE answers: "Continuously measure and alert when this threshold
+// is crossed." It runs 24/7.
+//
+// A ROUTER answers: "Is attack intent present somewhere? Route to the
+// right composite for confirmation."
+//
+// THIS HUNT exists because:
+//
+// 1. HYPOTHESIS VALIDATION:
+//    The composite (NamedPipe_C2_HighConfidence_MTDF_Composite.kql) detects
+//    known patterns. This hunt searches for UNKNOWN patterns — pipe names
+//    that don't match any known framework but are behaviorally anomalous.
+//    "What named pipe C2 activity is happening that we haven't profiled yet?"
+//
+// 2. BASELINE BUILDING:
+//    Before deploying the composite or router as production rules, a hunter
+//    needs to understand what "normal" named pipe activity looks like in
+//    THIS specific environment. This hunt surfaces the full landscape of
+//    pipe activity, allowing the analyst to:
+//    - Identify legitimate pipes that should be added to BaselinePipeFragments
+//    - Discover benign tools that create medium-risk-looking pipe names
+//    - Understand which hosts generate the most pipe activity
+//    - Build prevalence baselines before enabling continuous alerting
+//
+// 3. NEW THREAT ACTOR RESEARCH:
+//    When threat intelligence emerges about a new C2 framework or named pipe
+//    evasion technique, this hunt is the vehicle for testing the hypothesis:
+//    "Does this new technique appear in our environment?"
+//    Analysts modify the pipe lists and run this hunt before engineering
+//    a new composite.
+//
+// 4. RETROACTIVE INVESTIGATION:
+//    After an incident is confirmed (e.g., the composite fires), this hunt
+//    is run with extended lookback to understand the full scope:
+//    "Show me ALL pipe activity across the estate for the last 21 days
+//     around this host." The composite found the anchor; this hunt finds
+//     everything connected to it.
+//
+// ============================================================================
+// PEAK FRAMEWORK MAPPING
+// ============================================================================
+//
+// PREPARE:
+//   Hypothesis: Named pipe C2 or lateral movement is active in our estate.
+//   Data sources: DeviceEvents (NamedPipe*), DeviceNetworkEvents (SMB),
+//                 SecurityEvent 7045 (Service creation)
+//   Expected data gaps: Sysmon Event ID 17/18 may enrich if deployed
+//   Success criteria: Identify at least one unexplained pipe creation from
+//                     a high-risk process that is not in our baseline
+//
+// EXECUTE:
+//   Broad filter → Classify → Correlate → Score → Review manually
+//   Unlike the composite, the analyst reviews ALL findings including LOW
+//   severity to build baseline understanding
+//
+// ACT:
+//   For each finding:
+//     - If ForkNRunHex / Mojo / Epm → escalate to composite + incident response
+//     - If HighRisk framework name → validate with threat intel, escalate if confirmed
+//     - If MediumRisk + correlation → run SMB_Service_Lateral composite
+//     - If unknown pipe + anomalous behavior → research and engineer new composite
+//     - If benign → add to BaselinePipeFragments in composite and router
+//
+// KNOWLEDGE:
+//   Document all findings in hunt log.
+//   Update composite allow-lists.
+//   Update router decomposition tracker.
+//   Engineer new composites for any validated new threat patterns.
+//
+// ============================================================================
+// SYSMON INTEGRATION (if deployed)
+// ============================================================================
+//
+// Sysmon Event ID 17: Pipe Created
+// Sysmon Event ID 18: Pipe Connected
+//
+// If Sysmon is deployed and forwarding to Sentinel via SecurityEvent table,
+// the query below extends coverage to raw Sysmon pipe events which may
+// capture pipe activity that MDE's DeviceEvents doesn't log.
+//
+// Enable the Sysmon extension by setting UseSysmon = true below.
+// This extends the hunt's breadth at the cost of higher query volume.
+//
+// ============================================================================
+
+let lookback = 14d;    // Longer lookback than composite — hunt, not alert
+let slowServiceLookback = 21d;
+let nearSmbWindowMins = 10;
+let nearServiceWindowMins = 20;
+let slowServiceWindowDays = 7;
+let UseSysmon = false; // Set true if Sysmon Event ID 17/18 available in SecurityEvent
+
+// ── CONFIGURATION ────────────────────────────────────────────────────────────
+
+let BaselineAccounts = dynamic([
+    "NT AUTHORITY\\SYSTEM", "LOCAL SERVICE", "NETWORK SERVICE"
+]);
+
+let BaselinePipeFragments = dynamic([
+    "eventlog","winsock","sql","postgres","mysql","oracle",
+    "vmware","vbox","hyperv","docker",
+    "chrome","msedge","brave","firefox","teams","onedrive"
+]);
+
+let SuspiciousParents = dynamic([
+    "winword.exe","excel.exe","powerpnt.exe","outlook.exe",
+    "wscript.exe","cscript.exe","mshta.exe","powershell.exe","pwsh.exe","cmd.exe",
+    "rundll32.exe","regsvr32.exe","wmic.exe"
+]);
+
+let HighRiskPipes = dynamic([
+    "msse-","status_","msagent_","postex_","postex_ssh_","postex_shim",
+    "beacon_","beacon","pipetst","cobaltstrike_","cs_","csession","cspipe",
+    "searchtextharvester","mojo.5688.8052.",
+    "bruteratel","badger","bager","demon_pipe","mythic","nh_",
+    "sliverpipe","sliver_c2","sliver_multiplayer","operator","multiplayer","sliver",
+    "gruntsvc","covenant","empire","emppipe","poshc2","jaccdpqnvbrrxlaf",
+    "meterpreter","msfpipe","msf_",
+    "lsadump","cachedump","wceservicepipe","samdump","hashdump","credpipe","tokenpipe"
+]);
+
+let MediumRiskPipes = dynamic([
+    "psexesvc","psexesvc-","paexec",
+    "remcom","remcom_","remcom_svc","remcom_stdin","remcom_stdout","remcom_stderr",
+    "csexec","wmiexec","dcomexec","smbexec","atexec","scshell",
+    "svcctl","servicecontrol"
+]);
+
+let LegacyRpcPipes = dynamic([
+    "atsvc","spoolss","winreg","lsarpc","netlogon",
+    "samr","wkssvc","ntsvcs","w32time_alt","termsrv_api","epmapper"
+]);
+
+// ── SOURCE 1: MDE Named Pipe Events ──────────────────────────────────────────
+
+let MdePipeEvents =
+    DeviceEvents
+    | where TimeGenerated >= ago(lookback)
+    | where ActionType in ("NamedPipeEvent","NamedPipeCreated","NamedPipeConnected")
+    | extend F = parse_json(AdditionalFields)
+    | extend PipeName  = coalesce(tostring(F.PipeName), tostring(F.NamedPipe), tostring(F.Pipe))
+    | extend FileOp    = tostring(F.FileOperation)
+    | extend PipeLower = tolower(PipeName)
+    | where isnotempty(PipeName) or ActionType =~ "NamedPipeConnected"
+    | where PipeLower !has_any (BaselinePipeFragments)
+    | extend EventKind = case(
+        ActionType =~ "NamedPipeConnected", "Connected",
+        FileOp =~ "File connected",         "Connected",
+        FileOp =~ "File created",           "Created",
+        "Unknown"
+    )
+    | extend
+        SourceSystem = "MDE",
+        Proc         = tostring(InitiatingProcessFileName),
+        Parent       = tostring(InitiatingProcessParentFileName),
+        AcctName     = tostring(AccountName),
+        Cmd          = tostring(InitiatingProcessCommandLine)
+    | project
+        TimeGenerated, DeviceId,
+        DeviceName = tolower(DeviceName),
+        AcctName, Proc, Parent, Cmd,
+        PipeName, PipeLower, EventKind, SourceSystem;
+
+// ── SOURCE 2: Sysmon Pipe Events (optional, if deployed) ─────────────────────
+// Sysmon Event ID 17: Pipe Created
+// Sysmon Event ID 18: Pipe Connected
+// Enriches coverage for pipe activity MDE may not capture
+
+let SysmonPipeEvents =
+    SecurityEvent
+    | where TimeGenerated >= ago(lookback)
+    | where EventID in (17, 18)
+    | extend F = parse_xml(EventData)
+    | extend PipeName  = tostring(F.EventData.Data[5]["#text"])
+    | extend Proc      = tostring(F.EventData.Data[4]["#text"])
+    | extend PipeLower = tolower(PipeName)
+    | where isnotempty(PipeName)
+    | where PipeLower !has_any (BaselinePipeFragments)
+    | extend
+        SourceSystem = "Sysmon",
+        EventKind    = iff(EventID == 17, "Created", "Connected"),
+        DeviceName   = tolower(tostring(split(Computer, ".")[0])),
+        Parent       = "",
+        AcctName     = "",
+        Cmd          = "",
+        DeviceId     = ""
+    | project
+        TimeGenerated, DeviceId,
+        DeviceName, AcctName, Proc, Parent, Cmd,
+        PipeName, PipeLower, EventKind, SourceSystem;
+
+// ── COMBINE SOURCES ───────────────────────────────────────────────────────────
+
+let PipeEventsRaw =
+    union
+        (MdePipeEvents),
+        (iff(UseSysmon, SysmonPipeEvents, datatable(
+            TimeGenerated:datetime, DeviceId:string, DeviceName:string,
+            AcctName:string, Proc:string, Parent:string, Cmd:string,
+            PipeName:string, PipeLower:string, EventKind:string, SourceSystem:string
+        )[]))
+    | extend
+        // All truth anchors evaluated for every event
+        ForkNRunHex  = PipeName matches regex @"^\\\\\.\\pipe\\[0-9a-f]{7,10}$",
+        IsMojo       = PipeLower has @"\.\pipe\mojo.",
+        MojoLegitShape = PipeName matches regex @"^\\\\\.\\pipe\\mojo\.[0-9]{2,8}\.[0-9]{2,8}\.",
+        MojoDeviation = (PipeLower has @"\.\pipe\mojo.")
+                     and (
+                         not(PipeName matches regex @"^\\\\\.\\pipe\\mojo\.[0-9]{2,8}\.[0-9]{2,8}\.")
+                         or (tolower(Proc) !in~ ("chrome.exe","msedge.exe","brave.exe","firefox.exe"))
+                     ),
+        EpmTyposquat = (PipeLower has "epmap")
+                    and (PipeLower !has "epmapper")
+                    and (PipeName matches regex @"^\\\\\.\\pipe\\epmap[a-z]{1,6}$"),
+        IsHighRisk   = PipeLower has_any (HighRiskPipes),
+        IsMediumRisk = PipeLower has_any (MediumRiskPipes),
+        IsLegacyRpc  = PipeLower has_any (LegacyRpcPipes),
+        SuspParent   = tolower(Parent) has_any (SuspiciousParents),
+        AnonOrWeird  = isempty(PipeName) or PipeName matches regex @"[^\x20-\x7E]"
+    | extend PipeCategory = case(
+        ForkNRunHex,   "CS_ForkNRun",
+        MojoDeviation, "MojoMasquerade",
+        EpmTyposquat,  "RPC_Typosquat",
+        IsHighRisk,    "HighRiskFramework",
+        IsMediumRisk,  "MediumRisk",
+        IsLegacyRpc,   "LegacyRPC",
+        AnonOrWeird,   "AnomalousFormat",
+        "Unknown"
+    );
+
+// ── PREVALENCE ────────────────────────────────────────────────────────────────
+
+let PipeFrequency =
+    PipeEventsRaw
+    | summarize OrgPipeCount = count(), HostCount = dcount(DeviceName) by PipeName;
+
+// ── CORRELATION SIGNALS ───────────────────────────────────────────────────────
+
+let SmbPipeConnections =
+    DeviceNetworkEvents
+    | where TimeGenerated >= ago(lookback)
+    | where ActionType in ("ConnectionSuccess","NetworkConnectionSuccess","ConnectionSucceeded")
+    | where RemotePort in (445,139)
+    | extend F = parse_json(AdditionalFields)
+    | extend SmbPipeName = tostring(F.NamedPipe)
+    | where isnotempty(SmbPipeName)
+    | project
+        SmbTime    = TimeGenerated,
+        DeviceName = tolower(DeviceName),
+        RemoteIP, RemotePort,
+        SmbPipeName,
+        SmbPipeLower = tolower(SmbPipeName);
+
+let ServiceCreation =
+    SecurityEvent
+    | where TimeGenerated >= ago(slowServiceLookback)
+    | where EventID == 7045
+    | extend DeviceName = tolower(tostring(split(Computer, ".")[0]))
+    | project
+        SvcTime     = TimeGenerated,
+        DeviceName,
+        ServiceName = tostring(ServiceName),
+        ServiceFile = tostring(ServiceFileName),
+        ServiceAcct = tostring(Account);
+
+// ── FULL SCORING (hunt sees everything including LOW) ─────────────────────────
+
+PipeEventsRaw
+| join kind=leftouter PipeFrequency on PipeName
+| extend OrgPipeCount = coalesce(OrgPipeCount, 0), HostCount = coalesce(HostCount, 0)
+| join kind=leftouter (SmbPipeConnections) on DeviceName
+| extend SmbNear = isnotempty(RemoteIP)
+      and abs(datetime_diff("minute", TimeGenerated, SmbTime)) <= nearSmbWindowMins
+| extend PipeMatchesSmb = isnotempty(SmbPipeName)
+      and tolower(PipeName) == SmbPipeLower
+| join kind=leftouter (ServiceCreation) on DeviceName
+| extend ServiceNear = isnotempty(ServiceName)
+      and abs(datetime_diff("minute", TimeGenerated, SvcTime)) <= nearServiceWindowMins
+| extend ServiceSlow = isnotempty(ServiceName)
+      and abs(datetime_diff("day", TimeGenerated, SvcTime)) <= slowServiceWindowDays
+| extend
+    BaseScore = case(
+        ForkNRunHex,   85,
+        MojoDeviation, 75,
+        EpmTyposquat,  70,
+        IsHighRisk,    75,
+        IsMediumRisk,  55,
+        IsLegacyRpc,   35,
+        AnonOrWeird,   45,
+        25
+    ),
+    RarityScore = case(
+        OrgPipeCount <= 1,  25,
+        OrgPipeCount <= 3,  18,
+        OrgPipeCount <= 10, 10,
+        0
+    ),
+    SpreadPenalty = case(
+        HostCount >= 10, -15,
+        HostCount >= 5,   -8,
+        0
+    ),
+    ContextScore = (15 * iff(SuspParent, 1, 0))
+                + (20 * iff(SmbNear and PipeMatchesSmb, 1, 0))
+                + (10 * iff(ServiceNear, 1, 0))
+                + (6  * iff(ServiceSlow, 1, 0)),
+    BaselinePenalty = iff(AcctName in (BaselineAccounts), -10, 0)
+| extend FinalScore = tolong(BaseScore + RarityScore + SpreadPenalty + ContextScore + BaselinePenalty)
+| extend Severity = case(
+    FinalScore >= 95, "CRITICAL",
+    FinalScore >= 75, "HIGH",
+    FinalScore >= 55, "MEDIUM",
+    "LOW"
+  )
+// ── HUNT SHOWS EVERYTHING INCLUDING LOW ──────────────────────────────────────
+// Unlike composite (LOW filtered) and router (score < 30 filtered),
+// the hunt surfaces all findings so the analyst can:
+// 1. Build baseline understanding of pipe activity in this environment
+// 2. Identify benign pipes to suppress in composite/router
+// 3. Discover new patterns not yet in the indicator lists
+| extend HuntingDirectives = pack_array(
+    strcat("[PEAK:EXECUTE] Category=", PipeCategory, " | Pipe=", PipeName, " | Kind=", EventKind, " | Source=", SourceSystem),
+    strcat("[SCORE] Final=", tostring(FinalScore), " | Severity=", Severity,
+           " | Base=", tostring(BaseScore),
+           " | Rarity=", tostring(RarityScore),
+           " (OrgCount=", tostring(OrgPipeCount), ", HostCount=", tostring(HostCount), ")",
+           " | Context=", tostring(ContextScore)),
+    strcat("[PROCESS] Host=", DeviceName, " | Account=", AcctName,
+           " | Proc=", Proc, " | Parent=", Parent),
+    iif(ForkNRunHex,
+        "[PEAK:ACT] CS Fork-n-Run regex match. ESCALATE IMMEDIATELY. Run NamedPipe_C2_HighConfidence_MTDF_Composite + open incident.",
+        iif(MojoDeviation,
+            "[PEAK:ACT] Mojo browser pipe deviation. Escalate if process not Chrome/Edge/Brave/Firefox. Run composite.",
+            iif(EpmTyposquat,
+                "[PEAK:ACT] RPC epmapper typosquat. Near-zero legitimate explanation. Run composite. Escalate.",
+                iif(IsHighRisk,
+                    "[PEAK:ACT] Known C2 framework pipe name. Validate with threat intel. Run composite if confirmed.",
+                    iif(IsMediumRisk,
+                        "[PEAK:ACT] Medium-risk tool pipe (PsExec/RemCom/WMIExec-style). Run NamedPipe_LateralMovement_Router.kql for routing.",
+                        iif(IsLegacyRpc,
+                            "[PEAK:ACT] Legacy RPC pipe with suspicious context. Check for credential access / lateral movement. Run LSASS or SMB composites.",
+                            "[PEAK:ACT] Unknown/anomalous pipe. Review manually. If persistent and unexplained, engineer new composite."
+                        )
+                    )
+                )
+            )
+        )
+    ),
+    iif(SmbNear,
+        strcat("[LATERAL_MOVEMENT] SMB correlation detected: RemoteIP=", tostring(RemoteIP),
+               " | PipeMatch=", tostring(PipeMatchesSmb)),
+        "[LATERAL_MOVEMENT] No SMB correlation — local C2 pipe or non-SMB transport"),
+    iif(isnotempty(ServiceName),
+        strcat("[PERSISTENCE] Service correlation: ", ServiceName,
+               " | Near=", tostring(ServiceNear), " | Slow=", tostring(ServiceSlow)),
+        "[PERSISTENCE] No service correlation observed"),
+    // Analyst action guidance
+    "[BASELINE] If this pipe is from a known-good tool: add its fragment to BaselinePipeFragments in composite + router.",
+    "[KNOWLEDGE] Document all findings — new patterns become new composites or router entries.",
+    "[PIVOT] DeviceEvents | where ActionType has 'NamedPipe' and DeviceName == <host> | extend back ±60m",
+    "[PIVOT] DeviceProcessEvents parent lineage from Proc column on DeviceName",
+    "[PIVOT] DeviceNetworkEvents SMB 445/139 on DeviceName ±30m"
+)
+| project
+    TimeGenerated, DeviceName, AcctName,
+    PipeName, EventKind, PipeCategory, SourceSystem,
+    Proc, Parent, Cmd,
+    ForkNRunHex, MojoDeviation, EpmTyposquat, IsHighRisk,
+    IsMediumRisk, IsLegacyRpc, AnonOrWeird, SuspParent,
+    SmbNear, RemoteIP, RemotePort,
+    SmbPipeName, PipeMatchesSmb,
+    ServiceNear, ServiceSlow, ServiceName, ServiceFile,
+    OrgPipeCount, HostCount,
+    FinalScore, Severity,
+    HuntingDirectives
+| order by FinalScore desc, TimeGenerated desc

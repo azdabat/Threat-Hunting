@@ -1,0 +1,147 @@
+// ============================================================================
+// HUNT_Rogue-Device — SELF-CONTAINED TEST HARNESS (LAB-SAFE variant)
+// ============================================================================
+// Shadows DeviceInfo, DeviceNetworkEvents, DeviceProcessEvents,
+// DeviceLogonEvents, and the TVM secure-config tables. Validates:
+//   1. CRITICAL — 'HACKER-BOX': bad hostname + not in MDE inventory at all.
+//      Two strong signals together -> should fire CRITICAL.
+//   2. CLEAN    — 'ACME-LAP-07': correct naming, onboarded, no EDR issues.
+//      -> should NOT appear at all.
+//   3. BORDERLINE (the important negative case) — 'RANDOM-PC01': bad
+//      hostname ONLY, but properly onboarded with no EDR issues. Under the
+//      OLD v1 threshold (RiskScore >= 4) this device alone would have
+//      qualified and flooded the queue — exactly the false-positive risk
+//      flagged in review. Under the FIXED threshold it must NOT appear,
+//      proving the fix actually closes that gap rather than just
+//      theorising about it.
+//
+// KNOWN, DOCUMENTED TRADE-OFF from this fix: because no single signal now
+// reaches the RiskScore>=7 bar alone (max single-signal weight is 5, for
+// IsUnknownToMDE), a device with ONLY an EDR misconfiguration — otherwise
+// correctly named and onboarded — will also no longer fire on its own.
+// That is intentional, not an oversight: EDR-coverage-gap detection and
+// rogue/spoofed-device detection are arguably two different hypotheses
+// that were bundled into one score in v1. If pure EDR-gap coverage matters
+// to you independently of device legitimacy, that likely deserves its own
+// dedicated hunt rather than being folded back into this one's threshold.
+// ============================================================================
+
+let DeviceInfo = datatable(
+    MinutesAgo: long,
+    DeviceId: string,
+    DeviceName: string,
+    OSPlatform: string,
+    OnboardingState: string
+)
+[
+    // ACME-LAP-07 is properly inventoried and onboarded
+    60, "id-acme-lap-07", "ACME-LAP-07", "Windows11", "Onboarded",
+    // RANDOM-PC01 is ALSO properly inventoried and onboarded — only its
+    // name is non-standard. This is the point of the borderline test.
+    60, "id-random-pc01", "RANDOM-PC01", "Windows11", "Onboarded",
+    // HACKER-BOX is deliberately absent from DeviceInfo entirely —
+    // simulating a device MDE has never onboarded.
+]
+| extend Timestamp = ago(MinutesAgo * 1m);
+
+let DeviceNetworkEvents = datatable(
+    MinutesAgo: long,
+    DeviceName: string,
+    DeviceId: string
+)
+[
+    30, "HACKER-BOX",   "id-hacker-box",
+    30, "ACME-LAP-07",  "id-acme-lap-07",
+    30, "RANDOM-PC01",  "id-random-pc01",
+]
+| extend Timestamp = ago(MinutesAgo * 1m);
+
+let DeviceProcessEvents = datatable(Timestamp: datetime, DeviceName: string, DeviceId: string) [];
+let DeviceLogonEvents   = datatable(Timestamp: datetime, DeviceName: string, DeviceId: string) [];
+
+let DeviceTvmSecureConfigurationAssessment = datatable(
+    ConfigurationId: string, DeviceName: string, IsCompliant: long, IsApplicable: long, ConfigurationSubcategory: string
+) [];
+let DeviceTvmSecureConfigurationAssessmentKB = datatable(
+    ConfigurationId: string, ConfigurationName: string
+) [];
+
+// ============================================================================
+// DETECTION LOGIC BELOW — unmodified from HUNT_Rogue-Device_v2_LAB-SAFE.kql
+// ============================================================================
+
+let lookback = 30d;
+let ApprovedNamingPattern = @"^ACME-(DC|SVC|SQL|WIN|LAP|ADMIN)-\d{2}$";
+
+let MDEInventory =
+    DeviceInfo
+    | where Timestamp >= ago(lookback)
+    | summarize arg_max(Timestamp, *) by DeviceId
+    | project MDE_DeviceId = DeviceId, DeviceName, OSPlatform, OnboardingState;
+
+let TelemetryDevices =
+    union isfuzzy=true
+        (DeviceNetworkEvents | project Timestamp, DeviceName, DeviceId),
+        (DeviceProcessEvents | project Timestamp, DeviceName, DeviceId),
+        (DeviceLogonEvents  | project Timestamp, DeviceName, DeviceId)
+    | where isnotempty(DeviceName)
+    | summarize arg_max(Timestamp, *) by DeviceName
+    | project DeviceName, TelemetryDeviceId = DeviceId;
+
+let EdrConfigIssues =
+    DeviceTvmSecureConfigurationAssessment
+    | join kind=inner (DeviceTvmSecureConfigurationAssessmentKB) on ConfigurationId
+    | where IsCompliant == 0 and IsApplicable == 1
+    | where ConfigurationSubcategory == "EDR"
+    | summarize EdrIssueCount = count(), EdrIssues = make_set(ConfigurationName) by DeviceName;
+
+TelemetryDevices
+| extend NormalizedName = tostring(DeviceName)
+| extend NameOk = NormalizedName matches regex ApprovedNamingPattern
+| join kind=leftouter MDEInventory on DeviceName
+| join kind=leftouter EdrConfigIssues on DeviceName
+| extend IsOnboarded = case(OnboardingState == "Onboarded", 1, isnull(OnboardingState), 0, 0)
+| extend IsUnknownToMDE = iif(isnull(MDE_DeviceId) or OnboardingState != "Onboarded", 1, 0)
+| extend HasEdrIssues   = iif(EdrIssueCount > 0, 1, 0)
+| extend RiskScore =
+      0
+    + iif(NameOk == false, 4, 0)
+    + iif(IsUnknownToMDE == 1, 5, 0)
+    + iif(IsOnboarded == 0, 3, 0)
+    + iif(HasEdrIssues == 1, 4, 0)
+| extend SignalCount =
+      iif(NameOk == false, 1, 0)
+    + iif(IsUnknownToMDE == 1, 1, 0)
+    + iif(IsOnboarded == 0, 1, 0)
+    + iif(HasEdrIssues == 1, 1, 0)
+| where RiskScore >= 7 and SignalCount >= 2
+| extend HunterDirective = case(
+    NameOk == false and IsUnknownToMDE == 1,
+        "CRITICAL: Device is not in MDE inventory and has a non-standard hostname. Verify with asset owners and network diagrams. If unrecognised, isolate from the network.",
+    IsUnknownToMDE == 1 and IsOnboarded == 0,
+        "HIGH: Device appears in telemetry but is missing from MDE inventory/onboarding. Validate whether this is a shadow IT or attacker-controlled asset.",
+    NameOk == false and HasEdrIssues == 1,
+        "HIGH: Hostname breaks the corporate naming standard AND has EDR misconfiguration. Check AD computer object, DHCP leases, and network segment for spoofed or unmanaged hosts.",
+    HasEdrIssues == 1 and IsOnboarded == 1,
+        "HIGH: Onboarded device with EDR misconfiguration. Fix EDR policy, confirm sensor coverage, and re-check for gaps in other security controls.",
+    IsOnboarded == 0,
+        "MEDIUM: Device seems partially or not onboarded to EDR. Confirm deployment status and ensure full sensor coverage.",
+    "Investigate device legitimacy and ensure it is fully inventoried and covered by EDR."
+)
+| project
+    DeviceName, TelemetryDeviceId, MDE_DeviceId, OSPlatform, OnboardingState,
+    NameOk, IsUnknownToMDE, HasEdrIssues, EdrIssueCount, RiskScore, SignalCount,
+    HunterDirective
+| order by RiskScore desc, DeviceName
+
+// ============================================================================
+// EXPECTED RESULT: exactly 1 row.
+//   - HACKER-BOX: NameOk=false, IsUnknownToMDE=1 -> RiskScore=9, SignalCount=2
+//     -> CRITICAL. Fires correctly.
+//   - ACME-LAP-07: all clean -> RiskScore=0 -> correctly absent.
+//   - RANDOM-PC01: NameOk=false ONLY (score=4, SignalCount=1) -> correctly
+//     EXCLUDED under the fixed threshold. Under the OLD v1 threshold
+//     (RiskScore >= 4, no signal-count check) this row WOULD have appeared —
+//     if you want to see that difference directly, temporarily change the
+//     `where` clause above to `where RiskScore >= 4` and re-run.
+// ============================================================================

@@ -1,0 +1,154 @@
+// ============================================================================
+// HUNT_Outbound-C2 — SELF-CONTAINED TEST HARNESS (validates v2 fixes)
+// ============================================================================
+// Shadows DeviceNetworkEvents and DeviceFileCertificateInfo. Validates:
+//   1. CRITICAL — mshta.exe parent, unsigned binary, rare destination,
+//      High integrity, port 4444 -> should score High (>=10).
+//   2. BENIGN   — Cloudflare CDN destination, seen from 2 devices, signed
+//      binary, benign port 443 -> should score low/negative, Informational.
+//   3. FAN-OUT REGRESSION TEST (BUG-4) — the SAME RemoteIP hit by two
+//      DIFFERENT devices with two DIFFERENT parent processes. Under the
+//      ORIGINAL buggy design (ParentScore as a separate un-deduplicated
+//      lookup table joined back on RemoteIP), this would have produced a
+//      2x2 CARTESIAN fan-out = 4 output rows for this one IP instead of 2,
+//      with corrupted/duplicated scores. The fix computes ParentScore
+//      directly via extend with no lookup — this harness proves the row
+//      count for that IP is exactly 2, not 4.
+// ============================================================================
+
+let DeviceNetworkEvents = datatable(
+    MinutesAgo: long,
+    DeviceId: string,
+    DeviceName: string,
+    RemoteIP: string,
+    RemotePort: long,
+    RemoteUrl: string,
+    InitiatingProcessFileName: string,
+    InitiatingProcessCommandLine: string,
+    InitiatingProcessParentFileName: string,
+    InitiatingProcessAccountName: string,
+    InitiatingProcessIntegrityLevel: string,
+    Protocol: string,
+    SHA256: string,
+    InitiatingProcessSignatureStatus: string,
+    InitiatingProcessSignerType: string
+)
+[
+    // 1. CRITICAL case — unsigned binary
+    10, "d1", "WKSTN-01", "198.51.100.20", 4444, "evil-c2.example.net",
+        "powershell.exe", "powershell -enc AAA...", "mshta.exe", "jsmith", "High", "Tcp",
+        "AAAA1111", "Unsigned", "Unknown",
+
+    // 2. BENIGN case — two devices hitting the same well-known CDN, signed binary
+    15, "d2", "WKSTN-02", "3.5.7.9", 443, "assets.cloudflare.com",
+        "chrome.exe", "chrome.exe", "explorer.exe", "bwayne", "Medium", "Tcp",
+        "BBBB2222", "Valid", "Microsoft",
+    16, "d3", "WKSTN-03", "3.5.7.9", 443, "assets.cloudflare.com",
+        "chrome.exe", "chrome.exe", "explorer.exe", "cwhite", "Medium", "Tcp",
+        "BBBB2222", "Valid", "Microsoft",
+
+    // 3. FAN-OUT REGRESSION TEST — same RemoteIP, two devices, two parents
+    20, "d4", "WKSTN-04", "203.0.113.77", 8080, "notcdn.example.com",
+        "rundll32.exe", "rundll32.exe payload.dll", "mshta.exe", "duser", "High", "Tcp",
+        "CCCC3333", "Unsigned", "Unknown",
+    21, "d5", "WKSTN-05", "203.0.113.77", 8080, "notcdn.example.com",
+        "rundll32.exe", "rundll32.exe payload.dll", "cmd.exe", "euser", "Medium", "Tcp",
+        "DDDD4444", "Valid", "Contoso Ltd",
+]
+| extend Timestamp = ago(MinutesAgo * 1m);
+
+// ============================================================================
+// DETECTION LOGIC BELOW — unmodified from HUNT_Outbound-C2_v2.kql
+// ============================================================================
+
+let lookback = 7d;
+
+let KnownCDN = dynamic([
+    "cloudflare", "akamai", "fastly", "amazonaws",
+    "azureedge", "googleusercontent", "vercel", "netlify"
+]);
+
+let CommonBenignPorts   = dynamic([80, 443, 8080, 8443, 53]);
+let SuspiciousToolPorts = dynamic([4444, 5985, 5986, 1337, 31337]);
+
+let net =
+    DeviceNetworkEvents
+    | where Timestamp >= ago(lookback)
+    | where not(ipv4_is_private(RemoteIP))
+    | project
+        Timestamp, DeviceId, DeviceName, RemoteIP, RemotePort, RemoteUrl,
+        InitiatingProcessFileName, InitiatingProcessCommandLine,
+        InitiatingProcessParentFileName, InitiatingProcessAccountName,
+        InitiatingProcessIntegrityLevel, Protocol,
+        SHA256,
+        SigStatus = column_ifexists("InitiatingProcessSignatureStatus", ""),
+        SignerType = column_ifexists("InitiatingProcessSignerType", "");
+
+let OrgPrevalence =
+    net
+    | summarize OrgSeen = dcount(DeviceId) by RemoteIP;
+
+net
+| lookup OrgPrevalence on RemoteIP
+| extend OrgSeen  = coalesce(OrgSeen, 0)
+| extend SigScore = case(
+    SigStatus has_any ("Unsigned", "Invalid", "Untrusted") or SignerType == "Unknown", 5,
+    SigStatus == "" and SignerType == "", 3,
+    1
+)
+| extend ParentScore = case(
+    InitiatingProcessParentFileName =~ "mshta.exe", 5,
+    InitiatingProcessParentFileName =~ "wscript.exe"
+        or InitiatingProcessParentFileName =~ "cscript.exe", 4,
+    InitiatingProcessParentFileName =~ "rundll32.exe", 4,
+    InitiatingProcessParentFileName =~ "powershell.exe", 3,
+    InitiatingProcessParentFileName =~ "cmd.exe", 2,
+    1
+)
+| extend IsCDN = iif(RemoteUrl has_any (KnownCDN), 1, 0)
+| extend VT = strcat("https://www.virustotal.com/gui/ip-address/", RemoteIP)
+| extend RiskScore =
+      0
+    + iif(OrgSeen <= 1, 4, 0)
+    + iif(ParentScore >= 3, 3, 0)
+    + iif(SigScore >= 4, 4, 0)
+    + iif(InitiatingProcessIntegrityLevel == "High", 2, 0)
+    + iif(RemotePort in (SuspiciousToolPorts), 4, 0)
+    + iif(RemotePort !in (CommonBenignPorts)
+          and RemotePort !in (SuspiciousToolPorts), 1, 0)
+    + iif(IsCDN == 1, -4, 0)
+| extend Severity = case(
+    RiskScore >= 10, "High",
+    RiskScore >= 6,  "Medium",
+    RiskScore >= 3,  "Low",
+    "Informational"
+)
+| extend HunterDirective = case(
+    Severity == "High",
+        "CRITICAL: Rare outbound connection from high-risk parent process. Validate process tree, isolate host if unauthorized.",
+    Severity == "Medium",
+        "Investigate: Review process lineage, binary signature, and user context. Check if this connection is expected.",
+    Severity == "Low",
+        "Review: Rare destination but low-risk parent/context. Validate business justification.",
+    "Informational: Normal activity."
+)
+| project-reorder Timestamp, DeviceName, RemoteIP, RemotePort, Severity,
+                  RiskScore, OrgSeen, InitiatingProcessFileName,
+                  InitiatingProcessParentFileName, InitiatingProcessAccountName,
+                  VT, HunterDirective
+| order by RiskScore desc, Timestamp desc
+
+// ============================================================================
+// EXPECTED RESULT: exactly 5 rows total.
+//   - WKSTN-01 / 198.51.100.20 -> High. RiskScore = 4(rare)+3(mshta parent
+//     >=3)+4(unsigned)+2(High integrity)+4(port 4444)+0(IsCDN) = 17.
+//   - WKSTN-02 and WKSTN-03 / 3.5.7.9 -> Informational, RiskScore = -4
+//     (OrgSeen=2 so no rare bonus, signed binary, benign port 443, CDN
+//     penalty -4 dominates). Two rows, not merged — each connection event
+//     is scored independently, which is correct.
+//   - WKSTN-04 and WKSTN-05 / 203.0.113.77 -> EXACTLY 2 ROWS for this IP,
+//     not 4. This is the direct proof BUG-4's cartesian fan-out is fixed.
+//     If you ever see 4 rows for this IP instead of 2, the lookup-based
+//     ParentScore bug has been reintroduced somewhere — check for a
+//     reverted `lookup ParentScore on RemoteIP` pattern immediately.
+// ============================================================================

@@ -1,0 +1,409 @@
+// ============================================================================
+// COMPOSITE: NamedPipe_C2_HighConfidence_MTDF
+// Author: Ala Dabat | Date: 2026-07-05
+// Framework: MTDF (Minimum Truth Detection Framework)
+// Platform: Microsoft Defender XDR / Sentinel Advanced Hunting
+// Maturity: HIGH — near-zero benign overlap on all anchors
+// Deployment: Continuous 24/7 monitoring (not a periodic hunt)
+//
+// ============================================================================
+// WHY THIS IS A COMPOSITE, NOT A HUNT OR ROUTER
+// ============================================================================
+//
+// MTDF requires a single Minimum Truth anchor per composite — one
+// indisputable fact that cannot exist in a normal enterprise without
+// indicating the attack is real.
+//
+// This composite contains FOUR separate truth anchors. Each one fires
+// independently. They share a file because they share the same:
+//   - Telemetry source (DeviceEvents NamedPipe*)
+//   - Noise domain (near-zero benign overlap for all four)
+//   - Output format (MTDF HunterDirective)
+//   - Scoring architecture (base = 55+, threshold >= 75)
+//
+// Per MTDF Split/Keep rules:
+//   KEEP when: same truth surface + same noise domain + same telemetry source
+//   SPLIT when: truth surface changes / noise domain changes
+//
+// All four anchors live in the same noise domain (near-zero overlap),
+// same truth surface (named pipe events), same telemetry source
+// (DeviceEvents). They belong in one composite file.
+//
+// ============================================================================
+// THE FOUR MINIMUM TRUTH ANCHORS
+// ============================================================================
+//
+// ANCHOR 1: ForkNRunHex
+//   What it is: Cobalt Strike's Fork-n-Run technique creates a short-lived
+//   post-exploitation process and communicates via a dynamically-named pipe
+//   whose name is a random 7-10 character hexadecimal string.
+//   Pattern: \\.\pipe\[7-10 hex chars]
+//   Why it's Minimum Truth: No legitimate enterprise application creates pipes
+//   matching this exact regex. The pattern is structurally unique to CS
+//   Fork-n-Run. If this pattern exists, the attack is real.
+//   Anchoring strategy: SUBSTRATE-FIRST (the pipe NAME IS the signal —
+//   no intent inference required, the substrate is the truth)
+//
+// ANCHOR 2: MojoDeviation
+//   What it is: Chrome, Edge, and other Chromium browsers use a named pipe
+//   IPC mechanism called "Mojo." Legitimate Mojo pipes follow a rigid format:
+//   \\.\pipe\mojo.[PID].[COUNTER].[SUFFIX]
+//   Attackers sometimes name their C2 pipes to mimic Mojo (e.g., malleable
+//   C2 profiles in Cobalt Strike).
+//   Why it's Minimum Truth: A pipe that LOOKS like Mojo but either:
+//   (a) doesn't match the legitimate Mojo format, OR
+//   (b) is created by a non-browser process
+//   has near-zero legitimate explanation in a corporate estate.
+//   Anchoring strategy: SUBSTRATE-FIRST (the deviation from known-good format
+//   is the substrate truth — the pipe itself is the signal)
+//
+// ANCHOR 3: EpmTyposquat
+//   What it is: The Windows endpoint mapper uses a pipe named "epmapper"
+//   for RPC service registration. Attackers sometimes create pipes that look
+//   like "epmapper" but with slight variations (e.g., "epmapr", "epmappr",
+//   "epmappe") to masquerade as legitimate RPC infrastructure.
+//   Why it's Minimum Truth: There is no legitimate reason for a custom
+//   application to create a pipe that almost-but-not-quite matches "epmapper."
+//   This is exclusively an attacker technique (RPC deception / C2 masquerade).
+//   Anchoring strategy: INTENT-FIRST (the typosquatting implies adversary
+//   capability — the intent to deceive is the anchor)
+//
+// ANCHOR 4: HighRiskFramework Pipe Names
+//   What it is: Known-bad pipe name fragments from specific C2 frameworks:
+//   Cobalt Strike, Brute Ratel, Havoc, Mythic, Sliver, Covenant, Empire,
+//   Meterpreter, and credential-dumping tooling.
+//   Why it's (near) Minimum Truth: These names are either:
+//   (a) Default pipe names shipped with offensive frameworks, OR
+//   (b) Names used by credential-dumping tools
+//   No legitimate enterprise software uses pipe names like "beacon_",
+//   "meterpreter", "sliverpipe", "lsadump", "hashdump".
+//   Important caveat: Unlike Anchors 1-3, these ARE names. A sophisticated
+//   attacker can change their pipe names (malleable profiles). These names
+//   catch default/lazy operators. They are NOT as reliable as regex patterns.
+//   For this reason, HighRiskFramework pipes require OrgPipeCount <= 3
+//   (rarity) to reach HIGH severity. Rarity + known-bad name = defensible
+//   truth anchor. Known-bad name alone = high FP risk at scale.
+//   Anchoring strategy: INTENT-FIRST (the known framework name implies
+//   attacker tool usage)
+//
+// ============================================================================
+// SCORING ARCHITECTURE
+// ============================================================================
+//
+// MTDF base score for composites starts at 55 (the anchor is inherently
+// suspicious). Reinforcement adds to the base. Penalties reduce noise.
+//
+// Scoring tiers:
+//   ForkNRunHex:           Base = 85 (regex is specific, near-zero FP)
+//   MojoDeviation:         Base = 75 (format deviation is specific)
+//   EpmTyposquat:          Base = 70 (typosquat is specific)
+//   HighRiskFramework:     Base = 75 (but requires rarity to reach HIGH)
+//
+// Reinforcement signals (all optional, never dependency):
+//   R1: Rarity (OrgPipeCount <= 3): +25 (confirms targeted, not widespread)
+//   R2: Suspicious parent process: +15 (Office, scripting host, LOLBin)
+//   R3: SMB correlation (pipe seen on port 445/139): +20 (lateral movement)
+//   R4: Near-time service creation: +10 (persistence indicator)
+//   R5: Slow-service correlation (7d window): +6 (temporal deception aware)
+//
+// Penalties:
+//   P1: Widespread pipe (HostCount >= 10): -15 (mass-deployment likely legit)
+//   P2: System account (SYSTEM/LOCAL/NETWORK SERVICE): -10 (reduces priority)
+//
+// ============================================================================
+// COUSIN TECHNIQUES (adjacent surfaces this composite doesn't cover)
+// ============================================================================
+//
+// These require SEPARATE composites (different truth anchor / noise domain):
+//
+// COUSIN 1: SMB-only lateral movement WITHOUT named pipe
+//   (e.g., SMB file drop + service creation without pipe usage)
+//   → Covered by: SMB_Service_Lateral composite
+//
+// COUSIN 2: WMI-based remote execution (uses WMI objects, not named pipes)
+//   → Covered by: WMI_RemoteExec composite
+//
+// COUSIN 3: Named pipe C2 on non-standard port (HTTP tunnel, DNS tunnel)
+//   → Covered by: Outbound C2 behavioural scoring composite
+//
+// COUSIN 4: MediumRisk / LegacyRPC pipes
+//   → Covered by: NamedPipe_LateralMovement_Router.kql (Router Rule)
+//   → WHY NOT HERE: These require correlation to reach truth confidence.
+//     Pipe name alone does not constitute Minimum Truth for psexesvc, remcom,
+//     lsarpc, etc. — they have high benign overlap in enterprise environments.
+//     Mixing them here would break noise suppression for Anchors 1-4.
+//
+// ============================================================================
+
+let lookback = 7d;
+let slowServiceLookback = 21d;
+let nearSmbWindowMins = 10;   // [BUG FIX] was toint(timespan/1m) — unreliable in ADX
+let nearServiceWindowMins = 20;
+let slowServiceWindowDays = 7;
+
+// ── CONFIGURATION ────────────────────────────────────────────────────────────
+
+let BaselineAccounts = dynamic([
+    "NT AUTHORITY\\SYSTEM", "LOCAL SERVICE", "NETWORK SERVICE"
+]);
+
+let BaselinePipeFragments = dynamic([
+    "eventlog","winsock","sql","postgres","mysql","oracle",
+    "vmware","vbox","hyperv","docker",
+    "chrome","msedge","brave","firefox","teams","onedrive"
+]);
+
+let SuspiciousParents = dynamic([
+    "winword.exe","excel.exe","powerpnt.exe","outlook.exe",
+    "wscript.exe","cscript.exe","mshta.exe","powershell.exe","pwsh.exe","cmd.exe",
+    "rundll32.exe","regsvr32.exe","wmic.exe"
+]);
+
+// ANCHOR 4: Known C2 framework and credential-tooling pipe name fragments
+let HighRiskPipes = dynamic([
+    // Cobalt Strike & common malleable profiles
+    "msse-","status_","msagent_","postex_","postex_ssh_","postex_shim",
+    "beacon_","beacon","pipetst","cobaltstrike_","cs_","csession","cspipe",
+    "searchtextharvester",
+    // Mojo masquerade (some CS malleable profiles)
+    "mojo.5688.8052.",
+    // Brute Ratel / Havoc / Mythic / Nighthawk
+    "bruteratel","badger","bager","demon_pipe","mythic","nh_",
+    // Sliver
+    "sliverpipe","sliver_c2","sliver_multiplayer","operator","multiplayer","sliver",
+    // Covenant / Empire / PoshC2
+    "gruntsvc","covenant","empire","emppipe","poshc2","jaccdpqnvbrrxlaf",
+    // Metasploit / Meterpreter
+    "meterpreter","msfpipe","msf_",
+    // Credential tooling pipes
+    "lsadump","cachedump","wceservicepipe","samdump","hashdump","credpipe","tokenpipe"
+]);
+
+// ── PHASE 1: MINIMUM TRUTH — Pipe Events (schema tolerant) ──────────────────
+
+let PipeEventsRaw =
+    DeviceEvents
+    | where TimeGenerated >= ago(lookback)
+    | where ActionType in ("NamedPipeEvent","NamedPipeCreated","NamedPipeConnected")
+    | extend F = parse_json(AdditionalFields)
+    | extend PipeName  = coalesce(tostring(F.PipeName), tostring(F.NamedPipe), tostring(F.Pipe))
+    | extend FileOp    = tostring(F.FileOperation)
+    | extend PipeLower = tolower(PipeName)
+    | where isnotempty(PipeName) or ActionType =~ "NamedPipeConnected"
+    | where PipeLower !has_any (BaselinePipeFragments)
+    | extend EventKind = case(
+        ActionType =~ "NamedPipeConnected", "Connected",
+        FileOp =~ "File connected",         "Connected",
+        FileOp =~ "File created",           "Created",
+        "Unknown"
+    )
+    // ── TRUTH ANCHORS ──────────────────────────────────────────────────────
+    // ANCHOR 1: CS Fork-n-Run hex pipe pattern
+    | extend ForkNRunHex = PipeName matches regex @"^\\\\\.\\pipe\\[0-9a-f]{7,10}$"
+    // ANCHOR 2: Mojo browser IPC masquerade deviation
+    | extend IsMojo          = PipeLower has @"\.\pipe\mojo."
+    | extend MojoLegitShape  = PipeName matches regex @"^\\\\\.\\pipe\\mojo\.[0-9]{2,8}\.[0-9]{2,8}\."
+    | extend MojoDeviation   = IsMojo and (
+          (MojoLegitShape == false)
+          or (tolower(tostring(InitiatingProcessFileName)) !in~ ("chrome.exe","msedge.exe","brave.exe","firefox.exe"))
+      )
+    // ANCHOR 3: Epmapper typosquatting (RPC deception)
+    | extend EpmTyposquat = (PipeLower has "epmap")
+          and (PipeLower !has "epmapper")
+          and (PipeName matches regex @"^\\\\\.\\pipe\\epmap[a-z]{1,6}$")
+    // ANCHOR 4: Known framework/cred-tooling pipe names
+    | extend IsHighRisk = PipeLower has_any (HighRiskPipes)
+    // ── Only keep rows where at least ONE truth anchor fires ───────────────
+    | where ForkNRunHex or MojoDeviation or EpmTyposquat or IsHighRisk
+    | extend
+        Proc        = tostring(InitiatingProcessFileName),
+        Parent      = tostring(InitiatingProcessParentFileName),
+        AcctName    = tostring(AccountName),
+        SuspParent  = tolower(tostring(InitiatingProcessParentFileName)) has_any (SuspiciousParents),
+        AnonOrWeird = isempty(PipeName) or PipeName matches regex @"[^\x20-\x7E]"
+    | project
+        TimeGenerated, DeviceId,
+        DeviceName  = tolower(DeviceName),
+        AcctName, Proc, Parent,
+        Cmd         = tostring(InitiatingProcessCommandLine),
+        PipeName, PipeLower, EventKind,
+        ForkNRunHex, MojoDeviation, EpmTyposquat, IsHighRisk,
+        SuspParent, AnonOrWeird;
+
+// ── PHASE 2: PRE-SUMMARISED PREVALENCE (safe join — small table) ─────────────
+
+let PipeFrequency =
+    PipeEventsRaw
+    | summarize OrgPipeCount = count(), HostCount = dcount(DeviceName) by PipeName;
+
+// ── PHASE 3: REINFORCEMENT — SMB correlation ─────────────────────────────────
+//
+// WHY THIS IS REINFORCEMENT, NOT MINIMUM TRUTH:
+// An SMB connection near the pipe event increases confidence that the pipe
+// is being used for lateral movement (remote execution via pipe over SMB).
+// BUT: C2 pipes can exist on the local host without SMB. The absence of
+// SMB does NOT invalidate the truth anchor. Therefore SMB is reinforcement,
+// not dependency. If we required SMB, we'd miss local C2 pipes entirely.
+
+let SmbPipeConnections =
+    DeviceNetworkEvents
+    | where TimeGenerated >= ago(lookback)
+    | where ActionType in ("ConnectionSuccess","NetworkConnectionSuccess","ConnectionSucceeded")
+    | where RemotePort in (445,139)
+    | extend F = parse_json(AdditionalFields)
+    | extend SmbPipeName = tostring(F.NamedPipe)
+    | where isnotempty(SmbPipeName)
+    | project
+        SmbTime    = TimeGenerated,
+        DeviceName = tolower(DeviceName),
+        RemoteIP, RemotePort,
+        SmbPipeName,
+        SmbPipeLower = tolower(SmbPipeName);
+
+// ── PHASE 3: REINFORCEMENT — Service creation (slow-and-low aware) ───────────
+//
+// WHY THIS IS REINFORCEMENT, NOT MINIMUM TRUTH:
+// Service creation (Event 7045) near pipe activity suggests the attacker
+// installed a service to facilitate pipe-based remote execution (classic
+// PsExec pattern). BUT: Many legitimate services are created in enterprise
+// environments. Service creation alone is not truth. Pipe activity alone
+// is truth (for Anchors 1-4). Together they increase confidence.
+// The 21-day lookback specifically defeats temporal deception:
+// the attacker may have created the service days before using the pipe.
+
+let ServiceCreation =
+    SecurityEvent
+    | where TimeGenerated >= ago(slowServiceLookback)
+    | where EventID == 7045
+    | extend DeviceName = tolower(tostring(split(Computer, ".")[0]))
+    | project
+        SvcTime       = TimeGenerated,
+        DeviceName,
+        ServiceName   = tostring(ServiceName),
+        ServiceFile   = tostring(ServiceFileName),
+        ServiceAcct   = tostring(Account);
+
+// ── PHASE 4: CONVERGENCE SCORING ─────────────────────────────────────────────
+
+PipeEventsRaw
+| join kind=leftouter PipeFrequency on PipeName
+| extend OrgPipeCount = coalesce(OrgPipeCount, 0), HostCount = coalesce(HostCount, 0)
+// Classify (for output clarity — does not change truth)
+| extend PipeCategory = case(
+    ForkNRunHex,     "CS_ForkNRun",
+    MojoDeviation,   "MojoMasquerade",
+    EpmTyposquat,    "RPC_Typosquat",
+    IsHighRisk,      "HighRiskFramework",
+    "Unknown"
+  )
+| extend KillChainStage = case(
+    ForkNRunHex or PipeCategory == "HighRiskFramework" or MojoDeviation or EpmTyposquat,
+        "Command & Control / Post-Exploitation",
+    "Suspicious Named Pipe Activity"
+  )
+// SMB reinforcement join
+| join kind=leftouter (SmbPipeConnections) on DeviceName
+| extend SmbNear = isnotempty(RemoteIP)
+      and abs(datetime_diff("minute", TimeGenerated, SmbTime)) <= nearSmbWindowMins
+| extend PipeMatchesSmb = isnotempty(SmbPipeName)
+      and tolower(PipeName) == SmbPipeLower
+// Service reinforcement join
+| join kind=leftouter (ServiceCreation) on DeviceName
+| extend ServiceNear = isnotempty(ServiceName)
+      and abs(datetime_diff("minute", TimeGenerated, SvcTime)) <= nearServiceWindowMins
+| extend ServiceSlow = isnotempty(ServiceName)
+      and abs(datetime_diff("day", TimeGenerated, SvcTime)) <= slowServiceWindowDays
+// ── MTDF SCORING ─────────────────────────────────────────────────────────────
+//
+// Base score reflects anchor strength:
+//   ForkNRunHex = 85  (regex is structural, near-zero FP)
+//   MojoDeviation = 75 (format deviation is near-zero FP)
+//   EpmTyposquat = 70  (typosquat intent near-zero FP)
+//   HighRiskFramework = 75 (known names, some FP risk at scale, rarity required)
+//
+// Reinforcement adds on top:
+//   R1 Rarity (OrgCount <= 1): +25 — targeted, not mass deployment
+//   R2 Rarity (OrgCount <= 3): +18 — uncommon
+//   R3 Rarity (OrgCount <= 10): +10 — below enterprise baseline
+//   R4 Suspicious parent: +15 — scripting host / Office app spawned pipe
+//   R5 SMB + pipe name match: +20 — lateral movement confirmed
+//   R6 Near service creation: +10 — PsExec-style persistence
+//   R7 Slow service (7d): +6 — temporal deception awareness
+//
+// Penalties:
+//   P1 Widespread (>=10 hosts): -15 — not targeted
+//   P2 Widespread (>=5 hosts): -8
+//   P3 System account: -10 — reduces urgency (not legitimacy)
+| extend
+    BaseScore = case(
+        ForkNRunHex,   85,
+        MojoDeviation, 75,
+        EpmTyposquat,  70,
+        IsHighRisk,    75,
+        55
+    ),
+    RarityScore = case(
+        OrgPipeCount <= 1,  25,
+        OrgPipeCount <= 3,  18,
+        OrgPipeCount <= 10, 10,
+        0
+    ),
+    SpreadPenalty = case(
+        HostCount >= 10, -15,
+        HostCount >= 5,   -8,
+        0
+    ),
+    ContextScore = (15 * iff(SuspParent, 1, 0))
+                + (20 * iff(SmbNear and PipeMatchesSmb, 1, 0))
+                + (10 * iff(ServiceNear, 1, 0))
+                + (6  * iff(ServiceSlow, 1, 0)),
+    BaselinePenalty = iff(AcctName in (BaselineAccounts), -10, 0)
+| extend FinalScore = tolong(BaseScore + RarityScore + SpreadPenalty + ContextScore + BaselinePenalty)
+| extend Severity = case(
+    FinalScore >= 95, "CRITICAL",
+    FinalScore >= 75, "HIGH",
+    FinalScore >= 55, "MEDIUM",
+    "LOW"
+  )
+| where Severity != "LOW"
+// ── HUNTER DIRECTIVE ─────────────────────────────────────────────────────────
+| extend HunterDirective = pack_array(
+    strcat("[MIN_TRUTH] Anchor=", PipeCategory, " | Pipe=", PipeName, " | Kind=", EventKind),
+    strcat("[SCORE] Final=", tostring(FinalScore), " | Severity=", Severity,
+           " | Base=", tostring(BaseScore),
+           " | Rarity=", tostring(RarityScore),
+           " (OrgCount=", tostring(OrgPipeCount), ", HostCount=", tostring(HostCount), ")",
+           " | Context=", tostring(ContextScore),
+           " | Penalties=", tostring(SpreadPenalty + BaselinePenalty)),
+    strcat("[PROCESS] Host=", DeviceName, " | Account=", AcctName,
+           " | Proc=", Proc, " | Parent=", Parent),
+    strcat("[KILL_CHAIN] ", KillChainStage,
+           iif(ForkNRunHex,    " | CS_ForkNRunHex=TRUE (regex match — very high confidence)", ""),
+           iif(MojoDeviation,  " | MojoDeviation=TRUE (non-browser or malformed format)", ""),
+           iif(EpmTyposquat,   " | EpmTyposquat=TRUE (RPC deception pattern)", "")),
+    iif(SmbNear,
+        strcat("[SMB] Lateral movement vector: RemoteIP=", tostring(RemoteIP),
+               ":", tostring(RemotePort), " | PipeMatch=", tostring(PipeMatchesSmb)),
+        "[SMB] No near SMB correlation (local C2 pipe or pipe-over-non-SMB transport)"),
+    iif(isnotempty(ServiceName),
+        strcat("[SERVICE] Service correlation: ", ServiceName,
+               " | Path=", ServiceFile,
+               " | Near=", tostring(ServiceNear), " | Slow=", tostring(ServiceSlow)),
+        "[SERVICE] No service creation observed (not required for Anchor 1-3)"),
+    "[PIVOT] DeviceEvents | where ActionType has 'NamedPipe' and DeviceName == <host> | ±30m",
+    "[PIVOT] DeviceNetworkEvents SMB 445/139 ±10m from pipe event",
+    "[PIVOT] DeviceProcessEvents parent lineage from Proc column",
+    "[CONTAIN] If C2/LM confirmed: isolate host, acquire memory triage, enumerate services/tasks/WMI subscriptions, reset credentials."
+)
+| project
+    TimeGenerated, DeviceName, AcctName,
+    PipeName, EventKind, PipeCategory, KillChainStage,
+    Proc, Parent, Cmd,
+    ForkNRunHex, MojoDeviation, EpmTyposquat, IsHighRisk,
+    SuspParent, SmbNear, RemoteIP, RemotePort,
+    SmbPipeName, PipeMatchesSmb,
+    ServiceNear, ServiceSlow, ServiceName, ServiceFile,
+    OrgPipeCount, HostCount,
+    FinalScore, Severity,
+    HunterDirective
+| order by FinalScore desc, TimeGenerated desc

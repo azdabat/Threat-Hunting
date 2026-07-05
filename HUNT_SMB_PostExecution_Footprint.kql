@@ -1,0 +1,325 @@
+// ============================================================================
+// THREAT HUNT B: SMB_LateralMovement_PostExecution_Footprint
+// Author: Ala Dabat | Date: 2026-07-05
+// MITRE: T1021.002 (SMB), T1059 (Execution), T1071 (C2), T1087 (Discovery)
+//        T1547 (Persistence), T1570 (Lateral Tool Transfer)
+// Kill Chain Position: LATER than SMB_Service_Execution composite
+//
+// RELATIONSHIP TO COMPOSITE:
+//   The SMB_Service_Execution composite anchors on services.exe spawning
+//   an uncommon child — the execution moment. This hunt asks:
+//   "What did that process DO after it spawned?"
+//
+//   Composite fires:  services.exe → uncommon child (execution confirmed)
+//   This hunt fires:  that child process → C2 beacon / enumeration /
+//                     second-hop SMB / persistence writes
+//
+// WHY THIS IS A HUNT, NOT A COMPOSITE:
+//   Post-execution behavior is diverse. An attacker's tool might beacon,
+//   enumerate, pivot, or establish persistence — or all four. A composite
+//   anchored on one of these would miss the others. This hunt casts a wide
+//   net across ALL post-execution behaviors and surfaces the full footprint.
+//   When the composite fires, this hunt is the FIRST thing the analyst runs.
+//
+// MINIMUM TRUTH:
+//   A process whose parent is services.exe AND whose grandparent is NOT
+//   a known legitimate service spawner is performing post-execution activity:
+//   outbound network connections, spawning enumeration tools, writing to
+//   persistence locations, or connecting outbound to port 445/135
+//   (second-hop lateral movement).
+//
+// WHAT THIS CATCHES THAT THE COMPOSITE MISSES:
+//   1. C2 beaconing: the attacker's process phones home after execution
+//   2. Enumeration: whoami, net user, ipconfig, nltest, BloodHound
+//   3. Second-hop lateral movement: the compromised host is now the SOURCE
+//      of new SMB connections — the composite only looks for INBOUND
+//   4. Persistence: registry Run keys, scheduled tasks, WMI subscriptions
+//      written by the attacker's spawned process
+//   5. Credential access: LSASS access from the spawned process
+// ============================================================================
+
+let Lookback        = 7d;
+let PostExecWindow  = 2h;   // How long after service spawn to look for footprint
+
+// ── CONFIGURATION ────────────────────────────────────────────────────────────
+
+let CommonServiceChildren = dynamic([
+    "svchost.exe", "dllhost.exe", "taskhostw.exe", "taskhost.exe",
+    "conhost.exe", "msmpeng.exe", "senseir.exe",
+    "searchindexer.exe", "tiworker.exe"
+]);
+
+let KnownManagementTools = dynamic([
+    "ccmexec.exe", "sccmagent.exe", "intunemanagementextension.exe",
+    "taniumclient.exe", "qualysagent.exe"
+]);
+
+// Enumeration tools commonly used in the first 60 seconds after lateral movement
+let EnumerationTools = dynamic([
+    "whoami.exe", "net.exe", "net1.exe", "ipconfig.exe", "nltest.exe",
+    "arp.exe", "nslookup.exe", "ping.exe", "tracert.exe", "route.exe",
+    "netstat.exe", "tasklist.exe", "quser.exe", "wmic.exe",
+    "systeminfo.exe", "hostname.exe", "dsquery.exe", "ldifde.exe",
+    "adfind.exe", "sharphound.exe", "bloodhound.exe",
+    "powershell.exe", "pwsh.exe", "cmd.exe"
+]);
+
+let PersistenceKeys = dynamic([
+    "\\Software\\Microsoft\\Windows\\CurrentVersion\\Run",
+    "\\Software\\Microsoft\\Windows\\CurrentVersion\\RunOnce",
+    "\\System\\CurrentControlSet\\Services"
+]);
+
+// ── PHASE 1: MINIMUM TRUTH ───────────────────────────────────────────────────
+//
+// The anchor: services.exe spawned an uncommon child process.
+// This is the same execution event the composite anchors on.
+// The difference: the composite stops here. This hunt starts here.
+//
+// We capture the spawned process so we can track its CHILDREN and ACTIVITY.
+
+let AttackerSpawnedProcess =
+    DeviceProcessEvents
+    | where Timestamp >= ago(Lookback)
+    | where InitiatingProcessFileName =~ "services.exe"
+    | where not(tolower(FileName) in~ (CommonServiceChildren))
+    | where not(tolower(FileName) in~ (KnownManagementTools))
+    | project
+        DeviceId,
+        DeviceName,
+        SpawnTime    = Timestamp,
+        AttackerProc = FileName,
+        AttackerPid  = ProcessId,
+        AttackerCmd  = ProcessCommandLine,
+        AttackerAcct = AccountName,
+        AttackerSHA  = SHA256;
+
+// ── PHASE 2: POST-EXECUTION SIGNALS ──────────────────────────────────────────
+//
+// Four independent post-execution behaviors tracked separately.
+// Each tells a different part of the attacker's story.
+// None requires the others. All are worth knowing.
+
+// SIGNAL 2A: C2 Beaconing
+// WHY: Within minutes of execution, most implants phone home.
+// An outbound network connection from the attacker's process to an
+// external IP — especially on common C2 ports — is the first
+// post-execution signal to look for.
+
+let C2Beaconing =
+    DeviceNetworkEvents
+    | where Timestamp >= ago(Lookback)
+    | where ActionType in ("ConnectionSuccess","NetworkConnectionSucceeded")
+    | where not(ipv4_is_private(RemoteIP))
+    | where RemotePort in (80, 443, 8080, 8443, 4444, 1337, 53)
+    | project
+        DeviceId,
+        C2Time      = Timestamp,
+        C2IP        = RemoteIP,
+        C2Port      = RemotePort,
+        C2Proc      = InitiatingProcessFileName,
+        C2Pid       = InitiatingProcessId,
+        C2Url       = RemoteUrl;
+
+// SIGNAL 2B: Enumeration Activity
+// WHY: After landing on a host, attackers immediately enumerate:
+// who am I, what network am I on, what domain am I in, where can I go next?
+// Enumeration tools spawned by the attacker's process reveal intent.
+
+let EnumerationActivity =
+    DeviceProcessEvents
+    | where Timestamp >= ago(Lookback)
+    | where tolower(FileName) in~ (EnumerationTools)
+    | project
+        DeviceId,
+        EnumTime    = Timestamp,
+        EnumTool    = FileName,
+        EnumCmd     = ProcessCommandLine,
+        EnumPid     = ProcessId,
+        EnumParent  = InitiatingProcessFileName,
+        EnumParentPid = InitiatingProcessId;
+
+// SIGNAL 2C: Second-Hop Lateral Movement
+// WHY: The compromised host becomes the attacker's new pivot point.
+// Outbound SMB/RPC from this host to other internal hosts means the
+// attacker is moving again. The composite only watches for INBOUND SMB.
+// This hunt watches for OUTBOUND — the host is now the SOURCE.
+
+let SecondHopLateral =
+    DeviceNetworkEvents
+    | where Timestamp >= ago(Lookback)
+    | where ActionType in ("ConnectionSuccess","NetworkConnectionSucceeded")
+    | where RemotePort in (445, 135)
+    | where ipv4_is_private(RemoteIP)  // Internal only — attacker pivoting on LAN
+    | project
+        DeviceId,
+        HopTime     = Timestamp,
+        HopTarget   = RemoteIP,
+        HopPort     = RemotePort,
+        HopProc     = InitiatingProcessFileName,
+        HopPid      = InitiatingProcessId;
+
+// SIGNAL 2D: Persistence Writes
+// WHY: After execution, attackers establish persistence to survive reboots.
+// Registry Run keys, new service registrations, or scheduled task creation
+// from the spawned process's lineage indicates post-execution persistence.
+
+let PersistenceWrites =
+    DeviceRegistryEvents
+    | where Timestamp >= ago(Lookback)
+    | where ActionType == "RegistryValueSet"
+    | where RegistryKey has_any (PersistenceKeys)
+    | project
+        DeviceId,
+        PersistTime  = Timestamp,
+        PersistKey   = RegistryKey,
+        PersistValue = RegistryValueName,
+        PersistData  = RegistryValueData,
+        PersistProc  = InitiatingProcessFileName,
+        PersistPid   = InitiatingProcessId;
+
+// ── PHASE 3: SAFE PRE-SUMMARISED JOIN ────────────────────────────────────────
+// Summarise each signal per DeviceId before joining.
+// Never join four raw tables — pre-aggregate first.
+
+let C2Summary =
+    C2Beaconing
+    | summarize
+        C2Count    = count(),
+        C2IPs      = make_set(C2IP, 10),
+        C2Ports    = make_set(C2Port, 5),
+        C2Procs    = make_set(C2Proc, 5),
+        FirstC2    = min(C2Time)
+      by DeviceId;
+
+let EnumSummary =
+    EnumerationActivity
+    | summarize
+        EnumCount  = count(),
+        EnumTools  = make_set(EnumTool, 10),
+        EnumCmds   = make_set(EnumCmd, 5),
+        FirstEnum  = min(EnumTime)
+      by DeviceId;
+
+let HopSummary =
+    SecondHopLateral
+    | summarize
+        HopCount   = count(),
+        HopTargets = make_set(HopTarget, 10),
+        HopPorts   = make_set(HopPort, 5),
+        FirstHop   = min(HopTime)
+      by DeviceId;
+
+let PersistSummary =
+    PersistenceWrites
+    | summarize
+        PersistCount = count(),
+        PersistKeys  = make_set(PersistKey, 10),
+        PersistProcs = make_set(PersistProc, 5),
+        FirstPersist = min(PersistTime)
+      by DeviceId;
+
+// ── PHASE 4: CONVERGENCE SCORING ─────────────────────────────────────────────
+//
+// Start from the attacker's spawned process.
+// Join each post-execution signal. Score what was observed.
+// Multiple signals on the same host = high confidence of active intrusion.
+
+AttackerSpawnedProcess
+| join kind=leftouter (C2Summary)      on DeviceId
+| join kind=leftouter (EnumSummary)    on DeviceId
+| join kind=leftouter (HopSummary)     on DeviceId
+| join kind=leftouter (PersistSummary) on DeviceId
+// Only keep signals that occurred AFTER the spawn and within the window
+| where isempty(FirstC2)      or FirstC2      between (SpawnTime .. SpawnTime + PostExecWindow)
+| where isempty(FirstEnum)    or FirstEnum    between (SpawnTime .. SpawnTime + PostExecWindow)
+| where isempty(FirstHop)     or FirstHop     between (SpawnTime .. SpawnTime + PostExecWindow)
+| where isempty(FirstPersist) or FirstPersist between (SpawnTime .. SpawnTime + PostExecWindow)
+| extend
+    HasC2       = isnotempty(C2IPs),
+    HasEnum     = isnotempty(EnumTools),
+    HasHop      = isnotempty(HopTargets),
+    HasPersist  = isnotempty(PersistKeys)
+// Must have at least one post-execution signal — otherwise just the spawn
+| where HasC2 or HasEnum or HasHop or HasPersist
+| extend
+    // Base: execution anchor (services.exe spawned attacker process)
+    BaseScore       = 55,
+    // Reinforcement: each post-execution behavior adds confidence
+    R1_C2           = iif(HasC2,      30, 0),  // C2 beacon = near-certain active compromise
+    R2_Enum         = iif(HasEnum,    15, 0),  // Enumeration = attacker is mapping the environment
+    R3_SecondHop    = iif(HasHop,     25, 0),  // Second-hop = attacker is spreading
+    R4_Persist      = iif(HasPersist, 20, 0),  // Persistence = attacker intends to stay
+    // Spread bonus: multiple behaviors = more confident this is an active intrusion
+    R5_MultiSignal  = iif((toint(HasC2) + toint(HasEnum) + toint(HasHop) + toint(HasPersist)) >= 2, 15, 0)
+| extend FinalScore = BaseScore + R1_C2 + R2_Enum + R3_SecondHop + R4_Persist + R5_MultiSignal
+| extend Severity = case(
+    FinalScore >= 120, "CRITICAL",
+    FinalScore >= 90,  "HIGH",
+    FinalScore >= 55,  "MEDIUM",
+    "LOW"
+  )
+| where Severity != "LOW"
+
+// ── PHASE 5: HUNTER DIRECTIVE ─────────────────────────────────────────────────
+
+| extend HunterDirective = pack_array(
+    strcat("[MIN_TRUTH] services.exe spawned ", AttackerProc,
+           " (PID=", tostring(AttackerPid), ")",
+           " | Account=", AttackerAcct,
+           " | SHA256=", AttackerSHA),
+    strcat("[SCORE] Final=", tostring(FinalScore), " | Severity=", Severity,
+           " | Base=55 | C2=", tostring(R1_C2),
+           " | Enum=", tostring(R2_Enum),
+           " | SecondHop=", tostring(R3_SecondHop),
+           " | Persist=", tostring(R4_Persist),
+           " | MultiSignal=", tostring(R5_MultiSignal)),
+    // Each signal that fired gets its own line
+    iif(HasC2,
+        strcat("[C2_BEACON] Outbound C2 detected: IPs=", tostring(C2IPs),
+               " | Ports=", tostring(C2Ports),
+               " | FirstBeacon=", tostring(FirstC2)),
+        "[C2_BEACON] No outbound C2 observed in window"),
+    iif(HasEnum,
+        strcat("[ENUMERATION] Discovery tools observed: ", tostring(EnumTools),
+               " | FirstEnum=", tostring(FirstEnum),
+               " | SampleCmds=", tostring(EnumCmds)),
+        "[ENUMERATION] No enumeration tools observed in window"),
+    iif(HasHop,
+        strcat("[SECOND_HOP] Outbound SMB/RPC detected: Targets=", tostring(HopTargets),
+               " | Ports=", tostring(HopPorts),
+               " | FirstHop=", tostring(FirstHop),
+               " — this host is now the SOURCE of lateral movement"),
+        "[SECOND_HOP] No outbound SMB/RPC observed — attacker not yet pivoting"),
+    iif(HasPersist,
+        strcat("[PERSISTENCE] Registry persistence writes: Keys=", tostring(PersistKeys),
+               " | Writers=", tostring(PersistProcs),
+               " | FirstWrite=", tostring(FirstPersist)),
+        "[PERSISTENCE] No persistence writes observed in window"),
+    // Kill chain position
+    "[KILL_CHAIN] POST-EXECUTION: Attacker's process is active. Composite already fired or should fire. Containment window is NOW.",
+    // Immediate actions
+    "[ACTION_1] ISOLATE host immediately if CRITICAL/HIGH and C2 or second-hop is confirmed.",
+    "[ACTION_2] Pivot on AttackerProc SHA256 across estate — is the same binary on other hosts?",
+    "[ACTION_3] If second-hop detected: run SMB_Service_Execution composite on each HopTarget — they may be next victims.",
+    "[ACTION_4] If C2 IPs present: block at perimeter, hunt for those IPs across all DeviceNetworkEvents estate-wide.",
+    "[ACTION_5] If persistence confirmed: check DeviceRegistryEvents for the full persistence key and remove after isolation.",
+    "[PIVOT] DeviceProcessEvents | where DeviceName == <host> and InitiatingProcessId == <AttackerPid> | see all children",
+    "[PIVOT] DeviceNetworkEvents | where DeviceName == <host> and InitiatingProcessId == <AttackerPid> | all connections",
+    "[PIVOT] DeviceFileEvents | where DeviceName == <host> and InitiatingProcessId == <AttackerPid> | files written"
+)
+| project
+    SpawnTime,
+    Severity,
+    FinalScore,
+    DeviceName,
+    AttackerProc,
+    AttackerCmd,
+    AttackerAcct,
+    AttackerSHA,
+    HasC2,      C2IPs,      C2Ports,
+    HasEnum,    EnumTools,  EnumCmds,
+    HasHop,     HopTargets, HopPorts,
+    HasPersist, PersistKeys,
+    HunterDirective
+| order by FinalScore desc, SpawnTime desc
