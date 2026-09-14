@@ -5,7 +5,7 @@
 **Framework:** [Minimum Truth Detection Framework](https://github.com/azdabat/Minimum-Truth-Detection-Framework-ADX-Validated-Composite-Rules)  
 **License:** [CC BY-NC-SA 4.0](https://creativecommons.org/licenses/by-nc-sa/4.0/legalcode)  
 **Threat Hunting Roadmap:** [THR-ROADMAP — Threat Hunting Roadmap](https://azdabat.github.io/Threat-Hunting/roadmap/)
-https://azdabat.github.io/Threat-Hunting/roadmap/
+
 ---
 
 > *"Threat hunting is not the absence of alerts. It is the deliberate search for adversary behaviour that has not yet produced an alert — and the engineering of detections so that next time, it does."*
