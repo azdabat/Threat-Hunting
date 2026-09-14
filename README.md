@@ -4,6 +4,7 @@
 **Author:** Ala Dabat | 2026
 **Framework:** [Minimum Truth Detection Framework](https://github.com/azdabat/Minimum-Truth-Detection-Framework-ADX-Validated-Composite-Rules)  
 **License:** [CC BY-NC-SA 4.0](https://creativecommons.org/licenses/by-nc-sa/4.0/legalcode)
+** Threat Hunting Roadmap:** (https://azdabat.github.io/Threat-Hunting/roadmap/)
 
 ---
 
